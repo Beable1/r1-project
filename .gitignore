@@ -1,1 +1,41 @@
-/__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Dataset files - keep output/ folder but ignore contents
+output/data/
+output/videos/
+output/meta/episodes/
+
+# Other dataset directories
+dexterous_manipulation_60ep/
+
+# Large model files
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# USD thumbnails
+.thumbs/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.temp

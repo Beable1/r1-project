@@ -1,15 +1,17 @@
 {
-    "codebase_version": "v3.0",
+    "codebase_version": "v2.1",
     "robot_type": "r1_humanoid",
     "total_episodes": 1,
-    "total_frames": 790,
+    "total_frames": 92,
     "total_tasks": 1,
+    "total_chunks": 1,
+    "chunks_size": 1000,
     "fps": 10,
     "splits": {
         "train": "0:1"
     },
-    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
     "features": {
         "observation.state": {
             "dtype": "float32",

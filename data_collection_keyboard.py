@@ -9,23 +9,57 @@ import copy
 import time
 import cv2
 import os
-from tf2_msgs.msg import TFMessage
-from scipy.spatial.transform import Rotation as R
 import numpy as np
 from cv_bridge import CvBridge
-from math import sin, cos, pi
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import sys
 import termios
 import tty
+import subprocess
+import select
+
+# Mouse control
+try:
+    from pynput import mouse
+    from pynput.mouse import Controller as MouseController
+    MOUSE_AVAILABLE = True
+    mouse_controller = MouseController()
+except ImportError:
+    print("⚠ pynput modülü bulunamadı. Mouse kontrolü devre dışı. Yüklemek için: pip install pynput")
+    MOUSE_AVAILABLE = False
+    mouse_controller = None
+
+# Ekran boyutunu al (mouse kilitleme için)
+try:
+    import subprocess
+    result = subprocess.run(['xdpyinfo'], capture_output=True, text=True)
+    for line in result.stdout.split('\n'):
+        if 'dimensions' in line:
+            dims = line.split()[1].split('x')
+            SCREEN_WIDTH = int(dims[0])
+            SCREEN_HEIGHT = int(dims[1])
+            break
+    else:
+        SCREEN_WIDTH, SCREEN_HEIGHT = 1920, 1080
+except:
+    SCREEN_WIDTH, SCREEN_HEIGHT = 1920, 1080
 
 bridge = CvBridge()
 
+# Mouse kontrol değişkenleri
+mouse_control_enabled = False
+mouse_sensitivity = 0.002  # Mouse hareket hassasiyeti (radyan/pixel) - daha hızlı
+mouse_last_x = 0
+mouse_last_y = 0
+mouse_delta_x = 0
+mouse_delta_y = 0
+mouse_left_button = False
+mouse_right_button = False
+mouse_middle_button = False
+
 record_data = False
-tool_pose_xy = [0.0, 0.0] # tool(end effector) pose
-tbar_pose_xyw = [0.0, 0.0, 0.0]
 vid_H = 360
 vid_W = 640
 wrist_camera_image = np.zeros((vid_H, vid_W, 3), np.uint8)
@@ -34,35 +68,6 @@ rgb_image = np.zeros((vid_H, vid_W, 3), np.uint8)  # RGB image from /rgb topic
 action = np.array([0.0] * 17, float)  # Joint positions as action (17 joints for right arm)
 joint_states = {'names': [], 'positions': np.array([], float)}  # Joint states from /joint_states topic
 
-
-class Get_Poses_Subscriber(Node):
-
-    def __init__(self):
-        super().__init__('get_modelstate')
-        self.subscription = self.create_subscription(
-            TFMessage,
-            '/isaac_tf',
-            self.listener_callback,
-            10)
-        self.subscription
-
-        self.euler_angles = np.array([0.0, 0.0, 0.0], float)
-
-    def listener_callback(self, data):
-        global tool_pose_xy, tbar_pose_xyw
-
-        # 0:tool
-        tool_pose = data.transforms[0].transform.translation
-        tool_pose_xy[0] = tool_pose.y
-        tool_pose_xy[1] = tool_pose.x
-
-        # 1:tbar
-        tbar_translation  = data.transforms[1].transform.translation       
-        tbar_rotation = data.transforms[1].transform.rotation 
-        tbar_pose_xyw[0] = tbar_translation.y
-        tbar_pose_xyw[1] = tbar_translation.x
-        self.euler_angles[:] = R.from_quat([tbar_rotation.x, tbar_rotation.y, tbar_rotation.z, tbar_rotation.w]).as_euler('xyz', degrees=False)
-        tbar_pose_xyw[2] = self.euler_angles[2]
 
 class JointCommand_Subscriber(Node):
     """Subscribe to /joint_command topic to get action (joint positions)"""
@@ -286,6 +291,27 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
 
+def get_all_keys():
+    """Aynı anda basılan tüm tuşları al (non-blocking, çoklu tuş desteği)"""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    keys = []
+    try:
+        tty.setraw(sys.stdin.fileno())
+        # İlk tuşu bekle (blocking)
+        ch = sys.stdin.read(1)
+        keys.append(ch)
+        # Kısa süre içinde gelen diğer tuşları da oku (non-blocking)
+        while True:
+            if select.select([sys.stdin], [], [], 0.01)[0]:
+                ch = sys.stdin.read(1)
+                keys.append(ch)
+            else:
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return keys
+
 
 class Robot_Keyboard_Controller(Node):
 
@@ -347,13 +373,13 @@ class Robot_Keyboard_Controller(Node):
         # Adım boyutu (radyan) - tuş başına hareket miktarı
         self.step_size = 0.01
         
-        # Maksimum hız (radyan/saniye) - yavaş ve güvenli hareket için
-        self.max_velocity = 0.2  # 0.2 rad/s
-        self.control_rate = 50   # Hz - kontrol döngüsü frekansı
+        # Maksimum hız (radyan/saniye) - mouse için hızlı tepki
+        self.max_velocity = 4.0  # 3.0 rad/s - daha hızlı!
+        self.control_rate = 200  # Hz - 200Hz kontrol döngüsü (düşük gecikme)
         self.smooth_step = self.max_velocity / self.control_rate  # Her adımda maksimum hareket
 
         # Parmaklar biraz daha hızlı olabilir: ayrı hız limiti
-        self.finger_max_velocity = 0.35  # rad/s (arm: 0.2 rad/s)
+        self.finger_max_velocity = 1.5  # rad/s - daha hızlı parmak hareketi
         self.finger_smooth_step = self.finger_max_velocity / self.control_rate
 
         # Effort/Kuvvet limitleri (Newton-metre)
@@ -361,7 +387,7 @@ class Robot_Keyboard_Controller(Node):
         self.finger_max_effort = 5.0   # Nm - parmaklar için (düşük tutun!)
         self.arm_max_effort = 50.0     # Nm - kol joint'leri için
 
-        # Non-blocking hareket güncelleyici (50Hz): current_positions -> target_positions
+        # Non-blocking hareket güncelleyici (200Hz): current_positions -> target_positions
         self._motion_timer = self.create_timer(1.0 / self.control_rate, self._motion_update)
         
         # Parmak joint'leri
@@ -417,20 +443,247 @@ class Robot_Keyboard_Controller(Node):
             'z': ("wrist_roll_joint_r", +self.step_size),
             'x': ("wrist_roll_joint_r", -self.step_size),
 
-            # Baş parmak roll
-            'c': ("thumb_joint_roll_r", +self.step_size),
-            'v': ("thumb_joint_roll_r", -self.step_size),
+            # Baş parmak roll (3x daha hızlı)
+            'c': ("thumb_joint_roll_r", +self.step_size * 3),
+            'v': ("thumb_joint_roll_r", -self.step_size * 3),
         }
+        
+        # Mouse kontrol ayarları
+        self.mouse_enabled = False
+        self.mouse_sensitivity = 0.002  # radyan/pixel - daha hızlı kontrol
+        self.mouse_mode = 0  # 0: shoulder, 1: elbow, 2: wrist
+        self.mouse_mode_names = ['Shoulder (Omuz)', 'Elbow (Dirsek)', 'Wrist (Bilek)']
+        
+        # Mouse ile kontrol edilecek joint'ler (mod başına)
+        self.mouse_joint_mappings = {
+            0: {  # Shoulder mode
+                'x': 'right_shoulder_link_joint',  # Yatay hareket
+                'y': 'right_arm_top_link_joint',   # Dikey hareket
+            },
+            1: {  # Elbow mode
+                'x': 'right_arm_bottom_link_joint',
+                'y': 'right_forearm_link_joint',
+            },
+            2: {  # Wrist mode
+                'x': 'wrist_roll_joint_r',
+                'y': 'wrist_pitch_joint_r',
+            },
+        }
+        
+        # Mouse listener başlat (eğer pynput varsa)
+        self.mouse_listener = None
+        if MOUSE_AVAILABLE:
+            self._setup_mouse_listener()
         
         self.get_logger().info(f'Robot Keyboard Controller başlatıldı')
         self.get_logger().info(f'Topic: {topic_name}')
         self.get_logger().info(f'Joint sayısı: {len(self.joint_names)}')
+        if MOUSE_AVAILABLE:
+            self.get_logger().info('🖱️  Mouse kontrolü hazır (M tuşu ile aç/kapat)')
         
         # Başlangıçta home pozisyonuna git
         self.send_command()
-
+    
+    def _setup_mouse_listener(self):
+        """Mouse listener'ı başlat"""
+        global mouse_delta_x, mouse_delta_y, mouse_left_button, mouse_right_button, mouse_middle_button
+        
+        def on_move(x, y):
+            global mouse_last_x, mouse_last_y, mouse_delta_x, mouse_delta_y
+            if self.mouse_enabled:
+                # Kilitleme pozisyonundan itibaren delta hesapla (birikimli DEĞİL)
+                if hasattr(self, 'lock_position') and self.lock_position and mouse_controller:
+                    # Delta = mevcut pozisyon - kilit pozisyonu (doğrudan, biriktirme yok)
+                    mouse_delta_x = x - self.lock_position[0]
+                    mouse_delta_y = y - self.lock_position[1]
+                    # İmleci geri gönder
+                    mouse_controller.position = self.lock_position
+                    # Last pozisyonu kilit pozisyonuna ayarla
+                    mouse_last_x, mouse_last_y = self.lock_position
+                    return
+                else:
+                    mouse_delta_x = x - mouse_last_x
+                    mouse_delta_y = y - mouse_last_y
+            mouse_last_x = x
+            mouse_last_y = y
+        
+        def on_click(x, y, button, pressed):
+            global mouse_left_button, mouse_right_button, mouse_middle_button
+            if button == mouse.Button.left:
+                mouse_left_button = pressed
+            elif button == mouse.Button.right:
+                mouse_right_button = pressed
+            elif button == mouse.Button.middle:
+                mouse_middle_button = pressed
+        
+        def on_scroll(x, y, dx, dy):
+            # Scroll ile hassasiyet ayarla
+            global mouse_sensitivity
+            if self.mouse_enabled:
+                if dy > 0:
+                    self.mouse_sensitivity = min(0.005, self.mouse_sensitivity * 1.2)
+                else:
+                    self.mouse_sensitivity = max(0.00005, self.mouse_sensitivity / 1.2)
+                print(f"🖱️  Mouse hassasiyeti: {self.mouse_sensitivity:.5f}")
+        
+        try:
+            self.mouse_listener = mouse.Listener(
+                on_move=on_move,
+                on_click=on_click,
+                on_scroll=on_scroll
+            )
+            self.mouse_listener.start()
+            self.get_logger().info('🖱️  Mouse listener başlatıldı')
+        except Exception as e:
+            self.get_logger().warning(f'Mouse listener başlatılamadı: {e}')
+            self.mouse_listener = None
+    
+    def toggle_mouse_control(self):
+        """Mouse kontrolünü aç/kapat - aktifken imleç sağ alt köşeye kilitlenir"""
+        global mouse_delta_x, mouse_delta_y
+        self.mouse_enabled = not self.mouse_enabled
+        mouse_delta_x = 0
+        mouse_delta_y = 0
+        
+        if self.mouse_enabled:
+            # İmleci sağ alt köşeye taşı
+            if mouse_controller:
+                self.lock_position = (SCREEN_WIDTH - 50, SCREEN_HEIGHT - 50)
+                mouse_controller.position = self.lock_position
+            print(f"\n🖱️  MOUSE KONTROL AKTİF - Mod: {self.mouse_mode_names[self.mouse_mode]}")
+            print(f"    🔒 İmleç sağ alt köşeye kilitlendi ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
+            print("    Sol tık: Parmak kapat | Sağ tık: Parmak aç | Orta tık: Mod değiştir")
+            print("    Scroll: Hassasiyet ayarla | M: Mouse kapat")
+        else:
+            self.lock_position = None
+            print("\n⌨️  Klavye kontrolüne dönüldü - İmleç serbest")
+    
+    def cycle_mouse_mode(self):
+        """Mouse kontrol modunu değiştir (Shoulder -> Elbow -> Wrist)"""
+        self.mouse_mode = (self.mouse_mode + 1) % 3
+        print(f"🖱️  Mouse modu: {self.mouse_mode_names[self.mouse_mode]}")
+    
+    def process_mouse_input(self):
+        """FPS TARZI Mouse kontrolü - SİMÜLASYONDAKİ GERÇEK POZİSYONU KULLAN
+        
+        Birikme YOK çünkü:
+        - Her komutta simülasyonun GERÇEK pozisyonunu oku (/joint_states)
+        - O pozisyona delta ekle
+        - Simülasyon yetişemediyse önemli değil, hep güncel pozisyondan başlıyoruz
+        """
+        global mouse_delta_x, mouse_delta_y, mouse_left_button, mouse_right_button, mouse_middle_button
+        global joint_states
+        
+        if not self.mouse_enabled:
+            return
+        
+        # Delta'yı AL ve HEMEN SIFIRLA
+        dx = mouse_delta_x
+        dy = mouse_delta_y
+        mouse_delta_x = 0
+        mouse_delta_y = 0
+        
+        # Simülasyondan GERÇEK pozisyonları al
+        actual_positions = {}
+        if len(joint_states['names']) > 0 and len(joint_states['positions']) > 0:
+            actual_positions = dict(zip(joint_states['names'], joint_states['positions']))
+        
+        # Hareket mapping
+        mapping = self.mouse_joint_mappings.get(self.mouse_mode, {})
+        
+        # X ekseni
+        if 'x' in mapping and abs(dx) > 0:
+            joint_name = mapping['x']
+            # GERÇEK pozisyonu al (simülasyondan)
+            if joint_name in actual_positions:
+                real_pos = actual_positions[joint_name]
+            else:
+                real_pos = self.current_positions.get(joint_name, 0)
+            
+            # Delta hesapla ve sınırla (FPS sensitivity)
+            max_move = 0.1  # radyan - tek seferde maksimum
+            delta = dx * self.mouse_sensitivity
+            delta = max(-max_move, min(max_move, delta))
+            
+            # Yeni hedef = GERÇEK pozisyon + delta
+            new_pos = real_pos + delta
+            self.current_positions[joint_name] = new_pos
+            self.target_positions[joint_name] = new_pos
+        
+        # Y ekseni
+        if 'y' in mapping and abs(dy) > 0:
+            joint_name = mapping['y']
+            if joint_name in actual_positions:
+                real_pos = actual_positions[joint_name]
+            else:
+                real_pos = self.current_positions.get(joint_name, 0)
+            
+            max_move = 0.1
+            delta = -dy * self.mouse_sensitivity
+            delta = max(-max_move, min(max_move, delta))
+            
+            new_pos = real_pos + delta
+            self.current_positions[joint_name] = new_pos
+            self.target_positions[joint_name] = new_pos
+        
+        # Sol tık: parmakları kapat
+        if mouse_left_button:
+            for joint in self.finger_joints:
+                if joint != 'thumb_joint_roll_r':
+                    if joint in actual_positions:
+                        real_pos = actual_positions[joint]
+                    else:
+                        real_pos = self.current_positions.get(joint, 0)
+                    if real_pos < self.finger_full_closed:
+                        new_pos = min(real_pos + 0.15, self.finger_full_closed)
+                        self.current_positions[joint] = new_pos
+                        self.target_positions[joint] = new_pos
+        
+        # Sağ tık: parmakları aç
+        if mouse_right_button:
+            for joint in self.finger_joints:
+                if joint != 'thumb_joint_roll_r':
+                    if joint in actual_positions:
+                        real_pos = actual_positions[joint]
+                    else:
+                        real_pos = self.current_positions.get(joint, 0)
+                    if real_pos > self.finger_full_open:
+                        new_pos = max(real_pos - 0.15, self.finger_full_open)
+                        self.current_positions[joint] = new_pos
+                        self.target_positions[joint] = new_pos
+        
+        # Komut gönder
+        self.send_command()
+    
+    def toggle_mouse_control(self):
+        """Mouse kontrolünü aç/kapat - aktifken imleç sağ alt köşeye kilitlenir"""
+        global mouse_delta_x, mouse_delta_y
+        self.mouse_enabled = not self.mouse_enabled
+        mouse_delta_x = 0
+        mouse_delta_y = 0
+        
+        if self.mouse_enabled:
+            # Baz pozisyonları sıfırla (yeni oturum)
+            if hasattr(self, '_mouse_base_positions'):
+                del self._mouse_base_positions
+            
+            # İmleci sağ alt köşeye taşı
+            if mouse_controller:
+                self.lock_position = (SCREEN_WIDTH - 50, SCREEN_HEIGHT - 50)
+                mouse_controller.position = self.lock_position
+            print(f"\n🖱️  MOUSE KONTROL AKTİF - Mod: {self.mouse_mode_names[self.mouse_mode]}")
+            print(f"    🔒 İmleç sağ alt köşeye kilitlendi ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
+            print("    Sol tık: Parmak kapat | Sağ tık: Parmak aç | Orta tık: Mod değiştir")
+            print("    Scroll: Hassasiyet ayarla | M: Mouse kapat")
+        else:
+            self.lock_position = None
+            print("\n⌨️  Klavye kontrolüne dönüldü - İmleç serbest")
+    
     def _motion_update(self):
         """Non-blocking hareket: hedefe max_velocity ile yaklaş ve komut gönder."""
+        # Mouse input'u işle
+        self.process_mouse_input()
+        
         moved = False
         for joint_name in self.joint_names:
             current = self.current_positions[joint_name]
@@ -578,11 +831,15 @@ class JointStates_Subscriber(Node):
             self.joint_states_callback,
             10)
         self.subscription
+        self.get_logger().info('🔍 Joint States Subscriber başlatıldı - /joint_states topic dinleniyor...')
     
     def joint_states_callback(self, data):
         global joint_states
         joint_states['names'] = list(data.name)
         joint_states['positions'] = np.array(data.position, dtype=float)
+        # Debug: İlk veri geldiğinde log
+        if len(joint_states['positions']) > 0:
+            self.get_logger().info(f'✅ Joint states alındı: {len(joint_states["positions"])} joint, ilk 3: {joint_states["positions"][:3]}', once=True)
 
 class RGB_Camera_Subscriber(Node):
     """Subscribe to /rgb topic for camera image"""
@@ -600,36 +857,44 @@ class RGB_Camera_Subscriber(Node):
         global rgb_image
         rgb_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
 
-# Keep old camera subscribers for backward compatibility (if needed)
 class Wrist_Camera_Subscriber(Node):
-
+    """Subscribe to wrist camera topic (placeholder for backward compatibility)"""
+    
     def __init__(self):
         super().__init__('wrist_camera_subscriber')
         self.subscription = self.create_subscription(
             Image,
-            '/rgb_wrist',
+            '/wrist_camera',
             self.camera_callback,
             10)
-        self.subscription 
-
+        self.subscription
+    
     def camera_callback(self, data):
         global wrist_camera_image
-        wrist_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+        try:
+            wrist_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+        except:
+            pass
 
 class Top_Camera_Subscriber(Node):
-
+    """Subscribe to top camera topic (placeholder for backward compatibility)"""
+    
     def __init__(self):
         super().__init__('top_camera_subscriber')
         self.subscription = self.create_subscription(
             Image,
-            '/rgb_top',
+            '/top_camera',
             self.camera_callback,
             10)
-        self.subscription 
-
+        self.subscription
+    
     def camera_callback(self, data):
         global top_camera_image
-        top_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+        try:
+            top_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+        except:
+            pass
+
 
 class Data_Recorder(Node):
 
@@ -642,8 +907,9 @@ class Data_Recorder(Node):
         self.data_recorded = False
 
         #### log files for multiple runs are NOT overwritten
-        # Output directory (current project ./output)
-        self.base_dir = os.path.join(os.getcwd(), "output")
+        # Output directory (relative to script location, not cwd)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = os.path.join(script_dir, "output")
         self.log_dir = os.path.join(self.base_dir, "data/chunk-000/")
         os.makedirs(self.log_dir, exist_ok=True)
 
@@ -662,53 +928,10 @@ class Data_Recorder(Node):
         self.episode_index, self.index = self._detect_last_episode()
         print(f"📊 Mevcut episode sayısı: {self.episode_index}, Sonraki index: {self.index}")
 
-        # image of a T shape on the table
-        try:
-            self.initial_image = cv2.imread(os.environ['HOME'] + "/ur5_simulation/images/stand_top_plane.png")
-            if self.initial_image is not None:
-                self.initial_image = cv2.rotate(self.initial_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            else:
-                self.initial_image = np.zeros((vid_H, vid_W, 3), np.uint8)
-        except:
-            self.initial_image = np.zeros((vid_H, vid_W, 3), np.uint8)
- 
-        # for reward calculation
-        self.Tbar_region = np.zeros((self.initial_image.shape[0], self.initial_image.shape[1]), np.uint8)
-
-        # filled image of T shape on the table
-        try:
-            self.T_image = cv2.imread(os.environ['HOME'] + "/ur5_simulation/images/stand_top_plane_filled.png")
-            if self.T_image is not None:
-                self.T_image = cv2.rotate(self.T_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                img_gray = cv2.cvtColor(self.T_image, cv2.COLOR_BGR2GRAY)
-                thr, img_th = cv2.threshold(img_gray, 100, 255, cv2.THRESH_BINARY)
-                self.blue_region = cv2.bitwise_not(img_th)
-                self.blue_region_sum = cv2.countNonZero(self.blue_region)
-            else:
-                self.blue_region = np.zeros((vid_H, vid_W), np.uint8)
-                self.blue_region_sum = 1
-        except:
-            self.blue_region = np.zeros((vid_H, vid_W), np.uint8)
-            self.blue_region_sum = 1
-        
-        self.pub_img = self.create_publisher(Image, '/pushT_image', 10)
-        self.tool_radius = 10 # millimeters
-        self.scale = 1.639344 # mm/pix
-        self.C_W = 182 # pix
-        self.C_H = 152 # pix
-        self.OBL1 = int(150/self.scale)
-        self.OBL2 = int(120/self.scale)
-        self.OBW = int(30/self.scale)
-        # radius of the tool
-        self.radius = int(10/self.scale)
-
-        self.df = pd.DataFrame(columns=['observation.state', 'action', 'episode_index', 'frame_index', 'timestamp', 'next.reward', 'next.done', 'next.success', 'index', 'task_index'])
+        self.df = pd.DataFrame(columns=['observation.state', 'action', 'episode_index', 'frame_index', 'timestamp', 'index', 'task_index'])
         self.frame_index = 0
         self.time_stamp = 0.0
-        self.success = False
-        self.done = False
         self.column_index = 0
-        self.prev_sum = 0.0
 
         self.rgb_image_array = []
         
@@ -781,71 +1004,85 @@ class Data_Recorder(Node):
                 print(f"⚠ Episodes meta yükleme hatası: {e}")
 
     def timer_callback(self):
-        global tool_pose_xy, tbar_pose_xyw, action, wrist_camera_image, top_camera_image, rgb_image, joint_states, record_data
-        
-        image = copy.copy(self.initial_image)
-        self.Tbar_region[:] = 0
-
-        x = int((tool_pose_xy[0]*1000 + 300)/self.scale)
-        y = int((tool_pose_xy[1]*1000 - 320)/self.scale)
-
-        cv2.circle(image, center=(x, y), radius=self.radius, color=(100, 100, 100), thickness=cv2.FILLED)        
-        
-        # horizontal part of T
-        x1 = tbar_pose_xyw[0]
-        y1 = tbar_pose_xyw[1]
-        th1 = -tbar_pose_xyw[2] - pi/2
-        dx1 = -self.OBW/2*cos(th1 - pi/2)
-        dy1 = -self.OBW/2*sin(th1 - pi/2)
-        self.tbar1_ob = [[int(cos(th1)*self.OBL1/2     - sin(th1)*self.OBW/2   + dx1 + self.C_W + 1000*x1/self.scale), int(sin(th1)*self.OBL1/2    + cos(th1)*self.OBW/2   + dy1 + (1000*y1-320)/self.scale)],
-                          [int(cos(th1)*self.OBL1/2    - sin(th1)*(-self.OBW/2)+ dx1 + self.C_W + 1000*x1/self.scale), int(sin(th1)*self.OBL1/2    + cos(th1)*(-self.OBW/2)+ dy1 + (1000*y1-320)/self.scale)],
-                          [int(cos(th1)*(-self.OBL1/2) - sin(th1)*(-self.OBW/2)+ dx1 + self.C_W + 1000*x1/self.scale), int(sin(th1)*(-self.OBL1/2) + cos(th1)*(-self.OBW/2)+ dy1 + (1000*y1-320)/self.scale)],
-                          [int(cos(th1)*(-self.OBL1/2) - sin(th1)*self.OBW/2   + dx1 + self.C_W + 1000*x1/self.scale), int(sin(th1)*(-self.OBL1/2) + cos(th1)*self.OBW/2   + dy1 + (1000*y1-320)/self.scale)]]  
-        pts1_ob = np.array(self.tbar1_ob, np.int32)
-        cv2.fillPoly(image, [pts1_ob], (0, 0, 180))
-        cv2.fillPoly(self.Tbar_region, [pts1_ob], 255)
-        
-        #vertical part of T
-        th2 = -tbar_pose_xyw[2] - pi
-        dx2 = self.OBL2/2*cos(th2)
-        dy2 = self.OBL2/2*sin(th2)
-        self.tbar2_ob = [[int(cos(th2)*self.OBL2/2    - sin(th2)*self.OBW/2    + dx2 + self.C_W + 1000*x1/self.scale), int(sin(th2)*self.OBL2/2    + cos(th2)*self.OBW/2   + dy2 + (1000*y1-320)/self.scale)],
-                          [int(cos(th2)*self.OBL2/2    - sin(th2)*(-self.OBW/2)+ dx2 + self.C_W + 1000*x1/self.scale), int(sin(th2)*self.OBL2/2    + cos(th2)*(-self.OBW/2)+ dy2 + (1000*y1-320)/self.scale)],
-                          [int(cos(th2)*(-self.OBL2/2) - sin(th2)*(-self.OBW/2)+ dx2 + self.C_W + 1000*x1/self.scale), int(sin(th2)*(-self.OBL2/2) + cos(th2)*(-self.OBW/2)+ dy2 + (1000*y1-320)/self.scale)],
-                          [int(cos(th2)*(-self.OBL2/2) - sin(th2)*self.OBW/2   + dx2 + self.C_W + 1000*x1/self.scale), int(sin(th2)*(-self.OBL2/2) + cos(th2)*self.OBW/2   + dy2 + (1000*y1-320)/self.scale)]]  
-        pts2_ob = np.array(self.tbar2_ob, np.int32)
-        cv2.fillPoly(image, [pts2_ob], (0, 0, 180))
-        cv2.fillPoly(self.Tbar_region, [pts2_ob], 255)
-
-        common_part = cv2.bitwise_and(self.blue_region, self.Tbar_region)
-        common_part_sum = cv2.countNonZero(common_part)
-        sum = common_part_sum/self.blue_region_sum
-        sum_dif = sum - self.prev_sum
-        self.prev_sum = sum
-
-        cv2.circle(image, center=(int(self.C_W + 1000*x1/self.scale), int((1000*y1-320)/self.scale)), radius=2, color=(0, 200, 0), thickness=cv2.FILLED)  
-
-        img_msg = bridge.cv2_to_imgmsg(image)  
-        self.pub_img.publish(img_msg) 
+        global action, wrist_camera_image, top_camera_image, rgb_image, joint_states, record_data
 
         if record_data:
-            print('\033[32m'+f'RECORDING episode:{self.episode_index}, index:{self.index} sum:{sum}'+'\033[0m')
+            print('\033[32m'+f'RECORDING episode:{self.episode_index}, frame:{self.frame_index}, index:{self.index}'+'\033[0m')
 
-            if sum >= 0.90:
-                self.success = True
-                self.done = True
-                record_data = False
-                print('\033[31m'+'SUCCESS!'+f': {sum}'+'\033[0m')
+            # Observation.state: joint positions from /joint_states (filtered for right arm only)
+            # Right arm joint names to filter
+            right_arm_joint_names = [
+                "right_shoulder_link_joint",
+                "right_arm_top_link_joint",
+                "right_arm_bottom_link_joint",
+                "right_forearm_link_joint",
+                "wrist_pitch_joint_r",
+                "wrist_roll_joint_r",
+                "thumb_joint_roll_r",
+                "index_proximal_joint_r",
+                "middle_proximal_joint_r",
+                "ring_proximal_joint_r",
+                "little_proximal_joint_r",
+                "thumb_proximal_joint_r",
+                "index_proximal_joint_r_1",
+                "middle_proximal_joint_r_1",
+                "ring_proximal_joint_r_1",
+                "little_proximal_joint_r_1",
+                "thumb_proximal_joint_r_1",
+            ]
+            
+            # Filter joint states to get only right arm joints in correct order
+            observation_state = []
+            if len(joint_states['positions']) > 0 and len(joint_states['names']) > 0:
+                joint_dict = dict(zip(joint_states['names'], joint_states['positions']))
+                for joint_name in right_arm_joint_names:
+                    if joint_name in joint_dict:
+                        observation_state.append(float(joint_dict[joint_name]))
+                    else:
+                        observation_state.append(0.0)  # Missing joint defaults to 0
             else:
-                self.success = False
-
-            # Observation.state: joint positions from /joint_states
-            observation_state = copy.copy(joint_states['positions'].tolist() if len(joint_states['positions']) > 0 else [])
+                observation_state = [0.0] * len(right_arm_joint_names)
             
             # Action: joint positions from /joint_command (sent by control_right_arm.py)
             action_to_save = copy.copy(action.tolist() if len(action) > 0 else [])
             
-            self.df.loc[self.column_index] = [observation_state, action_to_save, self.episode_index, self.frame_index, self.time_stamp, sum, self.done, self.success, self.index, 0]
+            # DEBUG: Check if joint states are being received
+            if self.frame_index == 0:  # First frame
+                print('\n' + '='*70)
+                print('🔍 DATA RECORDING DEBUG (First Frame)')
+                print('='*70)
+                
+                # Check observation_state
+                if len(observation_state) == 0:
+                    print('\033[33m'+'⚠️  WARNING: observation_state BOŞ! /joint_states topic\'i veri göndermiyor olabilir!'+'\033[0m')
+                elif np.allclose(observation_state, 0.0):
+                    print('\033[33m'+'⚠️  WARNING: observation_state tümü 0.0! Joint states doğru gelmiyor olabilir!'+'\033[0m')
+                    print(f'   observation_state: {observation_state}')
+                else:
+                    print('\033[32m'+f'✅ observation_state OK: {len(observation_state)} joint'+'\033[0m')
+                    print(f'   İlk 5 değer: {[f"{v:.4f}" for v in observation_state[:5]]}')
+                    non_zero_count = sum(1 for v in observation_state if abs(v) > 0.001)
+                    print(f'   Sıfır olmayan joint sayısı: {non_zero_count}/{len(observation_state)}')
+                
+                # Check action
+                if len(action_to_save) == 0:
+                    print('\033[33m'+'⚠️  WARNING: action BOŞ!'+'\033[0m')
+                else:
+                    print('\033[32m'+f'✅ action OK: {len(action_to_save)} joint'+'\033[0m')
+                    print(f'   İlk 5 değer: {[f"{v:.4f}" for v in action_to_save[:5]]}')
+                    non_zero_count = sum(1 for v in action_to_save if abs(v) > 0.001)
+                    print(f'   Sıfır olmayan joint sayısı: {non_zero_count}/{len(action_to_save)}')
+                
+                # Check raw joint_states data
+                if len(joint_states['names']) > 0:
+                    print(f'\n📊 Raw /joint_states topic:')
+                    print(f'   Toplam joint sayısı: {len(joint_states["names"])}')
+                    print(f'   İlk 3 joint: {joint_states["names"][:3]}')
+                    print(f'   İlk 3 pozisyon: {[f"{v:.4f}" for v in joint_states["positions"][:3]]}')
+                
+                print('='*70 + '\n')
+            
+            self.df.loc[self.column_index] = [observation_state, action_to_save, self.episode_index, self.frame_index, self.time_stamp, self.index, 0]
             self.column_index += 1
             self.frame_index += 1
             self.time_stamp += 1/self.Hz
@@ -869,24 +1106,61 @@ class Data_Recorder(Node):
                 pq.write_table(table, self.log_dir + data_file_name)
                 print("The parquet file is generated!")
 
-                # Save video with H.264 codec (better compatibility)
-                # Try 'avc1' first (macOS), then 'x264', then fallback to 'mp4v'
+                # Save video with H.264 using ffmpeg directly (browser compatible)
                 video_path = self.rgb_vid_dir + video_file_name
+                temp_video_path = self.rgb_vid_dir + f"temp_{video_file_name}"
                 
-                # H.264 codec - avc1 for better compatibility
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')
-                out_rgb = cv2.VideoWriter(video_path, fourcc, self.Hz, (vid_W, vid_H))
+                # First save with OpenCV (any codec that works)
+                print("📹 Saving temporary video...")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out_rgb = cv2.VideoWriter(temp_video_path, fourcc, self.Hz, (vid_W, vid_H))
                 
-                # Fallback to mp4v if avc1 doesn't work
                 if not out_rgb.isOpened():
-                    print("⚠ avc1 codec failed, trying mp4v...")
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out_rgb = cv2.VideoWriter(video_path, fourcc, self.Hz, (vid_W, vid_H))
-                
-                for frame_rgb in self.rgb_image_array:
-                    out_rgb.write(frame_rgb)
-                out_rgb.release()
-                print("The RGB video is generated (H.264/avc1)!")
+                    print("⚠ VideoWriter failed to open!")
+                else:
+                    for frame_rgb in self.rgb_image_array:
+                        out_rgb.write(frame_rgb)
+                    out_rgb.release()
+                    print("✓ Temporary video saved")
+                    
+                    # Convert to H.264 using ffmpeg
+                    print("🔄 Converting to H.264 (browser compatible)...")
+                    try:
+                        ffmpeg_cmd = [
+                            'ffmpeg',
+                            '-y',  # Overwrite output file
+                            '-i', temp_video_path,  # Input
+                            '-c:v', 'libx264',  # H.264 codec
+                            '-preset', 'medium',  # Encoding speed
+                            '-crf', '23',  # Quality (lower = better, 18-28 range)
+                            '-pix_fmt', 'yuv420p',  # Pixel format (browser compatible)
+                            '-movflags', '+faststart',  # Enable streaming
+                            video_path  # Output
+                        ]
+                        
+                        result = subprocess.run(
+                            ffmpeg_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
+                        )
+                        
+                        if result.returncode == 0:
+                            print("✓ RGB video generated with H.264 (browser compatible)!")
+                            # Remove temporary file
+                            os.remove(temp_video_path)
+                        else:
+                            print(f"⚠ ffmpeg conversion failed: {result.stderr[:200]}")
+                            print("⚠ Using temporary mp4v video instead")
+                            os.rename(temp_video_path, video_path)
+                    
+                    except FileNotFoundError:
+                        print("⚠ ffmpeg not found, using mp4v codec")
+                        os.rename(temp_video_path, video_path)
+                    except Exception as e:
+                        print(f"⚠ Conversion error: {e}")
+                        if os.path.exists(temp_video_path):
+                            os.rename(temp_video_path, video_path)
 
                 # Update episode metadata for LeRobot v3.0
                 episode_length = self.frame_index
@@ -902,8 +1176,6 @@ class Data_Recorder(Node):
                 self.time_stamp = 0.0
                 self.column_index = 0
                 self.start_recording = False
-                self.success = False
-                self.done = False
                 
                 # Clear arrays for next episode
                 self.rgb_image_array.clear()
@@ -940,8 +1212,9 @@ class Data_Recorder(Node):
         print(f"📝 Episode {self.episode_index} metadata kaydedildi: {episode_length} frame")
 
     def _generate_meta_files(self):
-        """LeRobot v3.0 formatında tüm meta dosyalarını oluştur"""
+        """LeRobot v2.1 formatında tüm meta dosyalarını oluştur (JSONL based)"""
         import json
+        import glob
         
         # Joint isimleri (observation.state ve action için)
         joint_names = [
@@ -964,17 +1237,98 @@ class Data_Recorder(Node):
             "thumb_proximal_joint_r_1",
         ]
         
-        # 1. info.json
+        # Compute real statistics from all parquet files
+        all_obs_states = []
+        all_actions = []
+        episode_stats_list = []
+        
+        parquet_files = sorted(glob.glob(os.path.join(self.log_dir, "*.parquet")))
+        for pf in parquet_files:
+            try:
+                df = pd.read_parquet(pf)
+                ep_idx = df['episode_index'].iloc[0] if 'episode_index' in df.columns else 0
+                
+                # Extract observation.state and action arrays
+                obs_data = np.array([np.array(x) for x in df['observation.state'].values])
+                act_data = np.array([np.array(x) for x in df['action'].values])
+                
+                all_obs_states.append(obs_data)
+                all_actions.append(act_data)
+                
+                # Per-episode stats
+                ep_stats = {
+                    "episode_index": int(ep_idx),
+                    "stats": {
+                        "observation.state": {
+                            "min": obs_data.min(axis=0).tolist(),
+                            "max": obs_data.max(axis=0).tolist(),
+                            "mean": obs_data.mean(axis=0).tolist(),
+                            "std": obs_data.std(axis=0).tolist()
+                        },
+                        "action": {
+                            "min": act_data.min(axis=0).tolist(),
+                            "max": act_data.max(axis=0).tolist(),
+                            "mean": act_data.mean(axis=0).tolist(),
+                            "std": act_data.std(axis=0).tolist()
+                        }
+                    }
+                }
+                episode_stats_list.append(ep_stats)
+            except Exception as e:
+                print(f"⚠ Stats hesaplama hatası {pf}: {e}")
+        
+        # Global stats from all data
+        if all_obs_states:
+            all_obs = np.vstack(all_obs_states)
+            all_act = np.vstack(all_actions)
+            global_stats = {
+                "observation.state": {
+                    "min": all_obs.min(axis=0).tolist(),
+                    "max": all_obs.max(axis=0).tolist(),
+                    "mean": all_obs.mean(axis=0).tolist(),
+                    "std": all_obs.std(axis=0).tolist(),
+                    "count": len(all_obs)
+                },
+                "action": {
+                    "min": all_act.min(axis=0).tolist(),
+                    "max": all_act.max(axis=0).tolist(),
+                    "mean": all_act.mean(axis=0).tolist(),
+                    "std": all_act.std(axis=0).tolist(),
+                    "count": len(all_act)
+                }
+            }
+        else:
+            # Fallback if no data
+            global_stats = {
+                "observation.state": {
+                    "min": [-3.14] * len(joint_names),
+                    "max": [3.14] * len(joint_names),
+                    "mean": [0.0] * len(joint_names),
+                    "std": [1.0] * len(joint_names),
+                    "count": self.total_frames
+                },
+                "action": {
+                    "min": [-3.14] * len(joint_names),
+                    "max": [3.14] * len(joint_names),
+                    "mean": [0.0] * len(joint_names),
+                    "std": [1.0] * len(joint_names),
+                    "count": self.total_frames
+                }
+            }
+        
+        # 1. info.json (v2.1 format)
         info = {
-            "codebase_version": "v3.0",
+            "codebase_version": "v2.1",
             "robot_type": "r1_humanoid",
             "total_episodes": len(self.all_episodes_meta),
             "total_frames": self.total_frames,
             "total_tasks": 1,
+            "total_chunks": 1,
+            "chunks_size": 1000,
             "fps": self.Hz,
             "splits": {"train": f"0:{len(self.all_episodes_meta)}"},
-            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
             "features": {
                 "observation.state": {
                     "dtype": "float32",
@@ -1026,47 +1380,50 @@ class Data_Recorder(Node):
             }
         }
         
+        print(f"ℹ️  Dataset format: LeRobot v2.1 (JSONL based)")
+        
         info_path = os.path.join(self.meta_dir, "info.json")
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=4, ensure_ascii=False)
-        print(f"✅ info.json oluşturuldu")
+        print(f"✅ info.json oluşturuldu (v2.1)")
         
-        # 2. tasks.parquet
-        tasks_df = pd.DataFrame({
-            "task_index": [0],
-        }, index=["robot_arm_control"])
-        tasks_path = os.path.join(self.meta_dir, "tasks.parquet")
-        tasks_df.to_parquet(tasks_path)
-        print(f"✅ tasks.parquet oluşturuldu")
+        # 2. tasks.jsonl (v2.1 format - JSONL instead of parquet)
+        tasks_path = os.path.join(self.meta_dir, "tasks.jsonl")
+        with open(tasks_path, 'w') as f:
+            task_entry = {"task_index": 0, "task": "robot_arm_control"}
+            f.write(json.dumps(task_entry) + "\n")
+        print(f"✅ tasks.jsonl oluşturuldu")
         
-        # 3. episodes/chunk-000/file-000.parquet
-        if self.all_episodes_meta:
-            episodes_df = pd.DataFrame(self.all_episodes_meta)
-            episodes_path = os.path.join(self.episodes_meta_dir, "file-000.parquet")
-            episodes_df.to_parquet(episodes_path, index=False)
-            print(f"✅ episodes meta parquet oluşturuldu: {len(self.all_episodes_meta)} episode")
+        # 3. episodes.jsonl (v2.1 format - JSONL instead of parquet)
+        episodes_path = os.path.join(self.meta_dir, "episodes.jsonl")
+        with open(episodes_path, 'w') as f:
+            for ep_meta in self.all_episodes_meta:
+                episode_entry = {
+                    "episode_index": ep_meta["episode_index"],
+                    "tasks": [0],  # task_index as integer
+                    "length": ep_meta["length"]
+                }
+                f.write(json.dumps(episode_entry) + "\n")
+        print(f"✅ episodes.jsonl oluşturuldu: {len(self.all_episodes_meta)} episode")
         
-        # 4. stats.json (basit istatistikler - joint isimleriyle)
-        stats = {
-            "observation.state": {
-                "min": {name: -3.14 for name in joint_names},
-                "max": {name: 3.14 for name in joint_names},
-                "mean": {name: 0.0 for name in joint_names},
-                "std": {name: 1.0 for name in joint_names},
-                "count": self.total_frames
-            },
-            "action": {
-                "min": {name: -3.14 for name in joint_names},
-                "max": {name: 3.14 for name in joint_names},
-                "mean": {name: 0.0 for name in joint_names},
-                "std": {name: 1.0 for name in joint_names},
-                "count": self.total_frames
-            }
-        }
+        # 4. episodes_stats.jsonl (v2.1 - per-episode statistics)
+        episodes_stats_path = os.path.join(self.meta_dir, "episodes_stats.jsonl")
+        with open(episodes_stats_path, 'w') as f:
+            for ep_stats in episode_stats_list:
+                f.write(json.dumps(ep_stats) + "\n")
+        print(f"✅ episodes_stats.jsonl oluşturuldu")
+        
+        # 5. stats.json (global statistics - computed from real data)
         stats_path = os.path.join(self.meta_dir, "stats.json")
         with open(stats_path, 'w') as f:
-            json.dump(stats, f, indent=4, ensure_ascii=False)
-        print(f"✅ stats.json oluşturuldu")
+            json.dump(global_stats, f, indent=4, ensure_ascii=False)
+        print(f"✅ stats.json oluşturuldu (gerçek veriden hesaplandı)")
+        
+        # Cleanup old parquet meta files if they exist
+        old_tasks_parquet = os.path.join(self.meta_dir, "tasks.parquet")
+        if os.path.exists(old_tasks_parquet):
+            os.remove(old_tasks_parquet)
+            print(f"🗑️  Eski tasks.parquet silindi")
         
         print(f"🎉 Tüm meta dosyaları oluşturuldu! Toplam: {len(self.all_episodes_meta)} episode, {self.total_frames} frame")
 
@@ -1076,15 +1433,15 @@ class Data_Recorder(Node):
 
 
 def interactive_control(controller):
-    """İnteraktif klavye kontrolü - control_right_arm.py ile aynı"""
-    global record_data
+    """İnteraktif klavye + mouse kontrolü"""
+    global record_data, mouse_middle_button
     
     print("\n" + "="*70)
     print("RIGHT ARM & FINGERS CONTROL + DATA RECORDING")
     print("="*70)
     print(f"\nROS2 Topic: /joint_command")
     print(f"Controlled joints: {len(controller.joint_names)}")
-    print("\nControls:")
+    print("\n⌨️  KLAVYE KONTROL:")
     print("  Shoulder:")
     print("    a / w  -> right_shoulder_link_joint (+/- 0.01 rad)")
     print("    s / d  -> right_arm_top_link_joint (+/- 0.01 rad)")
@@ -1098,6 +1455,19 @@ def interactive_control(controller):
     print("    b      -> thumb_joint_roll_r toggle open/close")
     print("  Fingers (3-step cycle):")
     print("    g -> Cycle: Full open -> Half closed -> Full closed")
+    print("\n🖱️  MOUSE KONTROL:")
+    if MOUSE_AVAILABLE:
+        print("    m      -> Mouse kontrolü aç/kapat")
+        print("    n      -> Mouse modu değiştir (Shoulder/Elbow/Wrist)")
+        print("    (Mouse aktifken:)")
+        print("      Hareket    -> Seçili joint'leri kontrol et")
+        print("      Sol tık    -> Parmakları kapat")
+        print("      Sağ tık    -> Parmakları aç")
+        print("      Orta tık   -> Mod değiştir")
+        print("      Scroll     -> Hassasiyet ayarla")
+    else:
+        print("    ⚠ pynput modülü yüklü değil. Mouse kontrolü kullanılamaz.")
+        print("    Yüklemek için: pip install pynput")
     print("\n  Recording:")
     print("    SPACE -> Start/Stop Recording")
     print("\n  Other:")
@@ -1127,52 +1497,71 @@ def interactive_control(controller):
     
     while rclpy.ok():
         try:
-            key = get_key()
+            # Aynı anda basılan tüm tuşları al
+            keys = get_all_keys()
             
-            # ESC ile çıkış
-            if ord(key) == 27:
-                print("\nÇıkılıyor...")
-                break
-            
-            # SPACE ile kayıt başlat/durdur
-            if key == ' ':
-                push_time = time.time()
-                dif = push_time - prev_push_time
-                if dif > 1:  # Debounce
-                    if record_data == False:
-                        record_data = True
-                        print('\033[32m'+'🔴 START RECORDING'+'\033[0m')
-                    else:
-                        record_data = False
-                        print('\033[31m'+'⏹️  END RECORDING'+'\033[0m')
-                prev_push_time = push_time
-                continue
-            
-            key_lower = key.lower()
-            
-            # Özel komutlar
-            if key_lower == 'h':
-                controller.home()
-                continue
-            
-            if key_lower == 'p':
-                controller.show_positions()
-                continue
-            
-            # Parmak kontrolleri (3 aşama)
-            if key_lower == 'g':
-                controller.cycle_fingers()
-                continue
+            for key in keys:
+                # ESC ile çıkış
+                if ord(key) == 27:
+                    print("\nÇıkılıyor...")
+                    rclpy.shutdown()
+                    return
+                
+                # SPACE ile kayıt başlat/durdur
+                if key == ' ':
+                    push_time = time.time()
+                    dif = push_time - prev_push_time
+                    if dif > 1:  # Debounce
+                        if record_data == False:
+                            record_data = True
+                            print('\033[32m'+'🔴 START RECORDING'+'\033[0m')
+                        else:
+                            record_data = False
+                            print('\033[31m'+'⏹️  END RECORDING'+'\033[0m')
+                    prev_push_time = push_time
+                    continue
+                
+                key_lower = key.lower()
+                
+                # Özel komutlar
+                if key_lower == 'h':
+                    controller.home()
+                    continue
+                
+                if key_lower == 'p':
+                    controller.show_positions()
+                    continue
+                
+                # Parmak kontrolleri (3 aşama)
+                if key_lower == 'g':
+                    controller.cycle_fingers()
+                    continue
 
-            # Thumb-roll aç/kapat tek tuş
-            if key_lower == 'b':
-                controller.toggle_thumb_roll()
-                continue
-            
-            # Klavye mapping'den kontrol (kol kontrolleri)
-            if key_lower in controller.key_mappings:
-                joint_name, delta = controller.key_mappings[key_lower]
-                controller.update_position(joint_name, delta)
+                # Thumb-roll aç/kapat tek tuş
+                if key_lower == 'b':
+                    controller.toggle_thumb_roll()
+                    continue
+                
+                # Mouse kontrolü aç/kapat
+                if key_lower == 'm' and MOUSE_AVAILABLE:
+                    controller.toggle_mouse_control()
+                    continue
+                
+                # Mouse modu değiştir
+                if key_lower == 'n' and MOUSE_AVAILABLE and controller.mouse_enabled:
+                    controller.cycle_mouse_mode()
+                    continue
+                
+                # Orta tık ile mouse modu değiştir (mouse aktifken)
+                if mouse_middle_button and MOUSE_AVAILABLE and controller.mouse_enabled:
+                    mouse_middle_button = False  # Reset
+                    controller.cycle_mouse_mode()
+                    continue
+                
+                # Klavye mapping'den kontrol (kol kontrolleri)
+                if key_lower in controller.key_mappings:
+                    joint_name, delta = controller.key_mappings[key_lower]
+                    controller.update_position(joint_name, delta)
         
         except KeyboardInterrupt:
             print("\n\nDurduruldu.")
@@ -1184,20 +1573,18 @@ def interactive_control(controller):
 if __name__ == '__main__':
     rclpy.init(args=None)
 
-    get_poses_subscriber = Get_Poses_Subscriber()
-    joint_states_subscriber = JointStates_Subscriber()  # NEW: Joint states subscriber
-    joint_command_subscriber = JointCommand_Subscriber()  # NEW: Joint command subscriber (for action)
-    rgb_camera_subscriber = RGB_Camera_Subscriber()  # NEW: RGB camera subscriber
+    joint_states_subscriber = JointStates_Subscriber()
+    joint_command_subscriber = JointCommand_Subscriber()
+    rgb_camera_subscriber = RGB_Camera_Subscriber()
     robot_keyboard_controller = Robot_Keyboard_Controller()
     wrist_camera_subscriber = Wrist_Camera_Subscriber()  # Keep for backward compatibility
     top_camera_subscriber = Top_Camera_Subscriber()  # Keep for backward compatibility
     data_recorder = Data_Recorder()
 
     executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(get_poses_subscriber)
-    executor.add_node(joint_states_subscriber)  # NEW
-    executor.add_node(joint_command_subscriber)  # NEW
-    executor.add_node(rgb_camera_subscriber)  # NEW
+    executor.add_node(joint_states_subscriber)
+    executor.add_node(joint_command_subscriber)
+    executor.add_node(rgb_camera_subscriber)
     executor.add_node(robot_keyboard_controller)
     executor.add_node(wrist_camera_subscriber)
     executor.add_node(top_camera_subscriber)
