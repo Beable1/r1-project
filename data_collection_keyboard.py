@@ -27,11 +27,11 @@ try:
     MOUSE_AVAILABLE = True
     mouse_controller = MouseController()
 except ImportError:
-    print("⚠ pynput modülü bulunamadı. Mouse kontrolü devre dışı. Yüklemek için: pip install pynput")
+    print("⚠ pynput module not found. Mouse control disabled. To install: pip install pynput")
     MOUSE_AVAILABLE = False
     mouse_controller = None
 
-# Ekran boyutunu al (mouse kilitleme için)
+# Get screen size (for mouse locking)
 try:
     import subprocess
     result = subprocess.run(['xdpyinfo'], capture_output=True, text=True)
@@ -48,9 +48,9 @@ except:
 
 bridge = CvBridge()
 
-# Mouse kontrol değişkenleri
+# Mouse control variables
 mouse_control_enabled = False
-mouse_sensitivity = 0.002  # Mouse hareket hassasiyeti (radyan/pixel) - daha hızlı
+mouse_sensitivity = 0.002  # Mouse movement sensitivity (radians/pixel) - faster
 mouse_last_x = 0
 mouse_last_y = 0
 mouse_delta_x = 0
@@ -100,8 +100,8 @@ class RobotArmController(Node):
         topic_name = self.declare_parameter('topic_name', '/joint_command').value
         self.publisher = self.create_publisher(JointState, topic_name, 10)
         
-        # Robot joint isimleri - rod_graph.usda'daki JointNameArray ile eşleşmeli
-        # Toplam 43 joint
+        # Robot joint names - must match JointNameArray in rod_graph.usda
+        # Total 43 joints
         self.joint_names = [
             "Chest_link_joint",
             "hips_l",
@@ -148,32 +148,32 @@ class RobotArmController(Node):
             "thumb_proximal_joint_r_1"
         ]
         
-        self.get_logger().info(f'Robot Arm Controller başlatıldı')
+        self.get_logger().info(f'Robot Arm Controller started')
         self.get_logger().info(f'Topic: {topic_name}')
-        self.get_logger().info(f'Joint sayısı: {len(self.joint_names)}')
+        self.get_logger().info(f'Number of joints: {len(self.joint_names)}')
         
     def send_command(self, positions, velocities=None, duration_sec=3.0):
         """
-        Joint komutunu gönder.
+        Send Joint command.
         
         Args:
-            positions: List veya dict. Joint pozisyonları (radyan)
-            velocities: List veya dict. Joint hızları (radyan/s) - opsiyonel
-            duration_sec: Hareket süresi (saniye)
+            positions: List or dict. Joint positions (radians)
+            velocities: List or dict. Joint velocities (radians/s) - optional
+            duration_sec: Movement duration (seconds)
         """
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'base_link'
         msg.name = self.joint_names
         
-        # Pozisyonları hazırla
+        # Prepare positions
         if isinstance(positions, dict):
             pos_list = [positions.get(name, 0.0) for name in self.joint_names]
         else:
             pos_list = list(positions) if len(positions) >= len(self.joint_names) else list(positions) + [0.0] * (len(self.joint_names) - len(positions))
             pos_list = pos_list[:len(self.joint_names)]
         
-        # Hızlar
+        # Velocities
         if velocities is None:
             vel_list = [0.0] * len(self.joint_names)
         elif isinstance(velocities, dict):
@@ -186,16 +186,16 @@ class RobotArmController(Node):
         msg.velocity = vel_list
         msg.effort = [0.0] * len(self.joint_names)
         
-        # Yayınla
+        # Publish
         self.publisher.publish(msg)
-        self.get_logger().info(f'Komut gönderildi: {pos_list[:5]}... (ilk 5 joint)')
+        self.get_logger().info(f'Command sent: {pos_list[:5]}... (first 5 joints)')
         return msg
     
     def move_joint(self, joint_name, position, duration_sec=2.0):
-        """Belirli bir joint'i hareket ettir"""
+        """Move a specific joint"""
         if joint_name not in self.joint_names:
-            self.get_logger().error(f'Joint bulunamadı: {joint_name}')
-            self.get_logger().info(f'Mevcut jointler: {self.joint_names}')
+            self.get_logger().error(f'Joint not found: {joint_name}')
+            self.get_logger().info(f'Available joints: {self.joint_names}')
             return False
         
         positions = {joint_name: float(position)}
@@ -203,31 +203,31 @@ class RobotArmController(Node):
         return True
     
     def move_all(self, positions, duration_sec=3.0):
-        """Tüm joint'leri hareket ettir"""
+        """Move all joints"""
         self.send_command(positions, duration_sec=duration_sec)
     
     def home(self, duration_sec=3.0):
-        """Tüm joint'leri sıfır pozisyonuna al"""
+        """Reset all joints to zero position"""
         positions = [0.0] * len(self.joint_names)
         self.send_command(positions, duration_sec=duration_sec)
-        self.get_logger().info('Home pozisyonuna gidiliyor...')
+        self.get_logger().info('Moving to Home position...')
 
 def interactive_control(controller):
-    """İnteraktif kontrol döngüsü - from control_robot_arms.py - unchanged"""
+    """Interactive control loop - from control_robot_arms.py - unchanged"""
     print("\n" + "="*60)
-    print("ROBOT KOL KONTROLÜ")
+    print("ROBOT ARM CONTROL")
     print("="*60)
-    print("\nKomutlar:")
-    print("  set <pos1> <pos2> ...     -> Tüm joint'leri belirtilen pozisyonlara al")
-    print("  move <joint_name> <pos>   -> Belirli bir joint'i hareket ettir")
-    print("  home                     -> Tüm joint'leri sıfır pozisyonuna al")
-    print("  list                     -> Joint isimlerini listele")
-    print("  quit                     -> Çıkış")
+    print("\nCommands:")
+    print("  set <pos1> <pos2> ...     -> Set all joints to specified positions")
+    print("  move <joint_name> <pos>   -> Move a specific joint")
+    print("  home                     -> Reset all joints to zero position")
+    print("  list                     -> List joint names")
+    print("  quit                     -> Exit")
     print("\n" + "-"*60 + "\n")
     
     while rclpy.ok():
         try:
-            command = input("Komut> ").strip()
+            command = input("Command> ").strip()
             
             if not command:
                 continue
@@ -236,52 +236,52 @@ def interactive_control(controller):
             cmd = parts[0].lower()
             
             if cmd == 'quit' or cmd == 'exit' or cmd == 'q':
-                print("Çıkılıyor...")
+                print("Exiting...")
                 break
             
             elif cmd == 'home':
                 controller.home()
             
             elif cmd == 'list':
-                print("\nJoint İsimleri:")
+                print("\nJoint Names:")
                 for i, name in enumerate(controller.joint_names):
                     print(f"  [{i}] {name}")
                 print()
             
             elif cmd == 'set':
                 if len(parts) < 2:
-                    print("Kullanım: set <pos1> <pos2> ...")
+                    print("Usage: set <pos1> <pos2> ...")
                     continue
                 try:
                     positions = [float(p) for p in parts[1:]]
                     controller.move_all(positions)
                 except ValueError as e:
-                    print(f"Hata: Geçersiz pozisyon değeri - {e}")
+                    print(f"Error: Invalid position value - {e}")
             
             elif cmd == 'move':
                 if len(parts) < 3:
-                    print("Kullanım: move <joint_name> <position>")
+                    print("Usage: move <joint_name> <position>")
                     continue
                 try:
                     joint_name = parts[1]
                     position = float(parts[2])
                     controller.move_joint(joint_name, position)
                 except ValueError as e:
-                    print(f"Hata: Geçersiz pozisyon değeri - {e}")
+                    print(f"Error: Invalid position value - {e}")
             
             else:
-                print(f"Bilinmeyen komut: {cmd}")
-                print("Komutlar: set, move, home, list, quit")
+                print(f"Unknown command: {cmd}")
+                print("Commands: set, move, home, list, quit")
         
         except EOFError:
-            print("\nÇıkılıyor...")
+            print("\nExiting...")
             break
         except Exception as e:
-            print(f"Hata: {e}")
+            print(f"Error: {e}")
 
 
 def get_key():
-    """Tek bir tuş basımını al (non-blocking)"""
+    """Get single key press (non-blocking)"""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
@@ -292,7 +292,7 @@ def get_key():
     return ch
 
 def get_all_keys():
-    """Aynı anda basılan tüm tuşları al (non-blocking, çoklu tuş desteği)"""
+    """Get all simultaneously pressed keys (non-blocking, multi-key support)"""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     keys = []
@@ -301,7 +301,7 @@ def get_all_keys():
         # İlk tuşu bekle (blocking)
         ch = sys.stdin.read(1)
         keys.append(ch)
-        # Kısa süre içinde gelen diğer tuşları da oku (non-blocking)
+        # Read other keys arriving within a short duration (non-blocking)
         while True:
             if select.select([sys.stdin], [], [], 0.01)[0]:
                 ch = sys.stdin.read(1)
@@ -322,7 +322,7 @@ class Robot_Keyboard_Controller(Node):
         topic_name = self.declare_parameter('topic_name', '/joint_command').value
         self.publisher = self.create_publisher(JointState, topic_name, 10)
         
-        # Sağ kol ve parmak joint'leri (control_right_arm.py ile aynı)
+        # Right arm and finger joints (same as control_right_arm.py)
         self.joint_names = [
             "right_shoulder_link_joint",      # Omuz
             "right_arm_top_link_joint",        # Üst kol
@@ -343,7 +343,7 @@ class Robot_Keyboard_Controller(Node):
             "thumb_proximal_joint_r_1"          # Baş parmak 2
         ]
         
-        # Home pozisyonları (robotun doğal duruş pozisyonu)
+        # Home positions (natural standing position of the robot)
         self.home_positions = {
             "right_shoulder_link_joint": 0.17,
             "right_arm_top_link_joint": -1.46,
@@ -364,33 +364,33 @@ class Robot_Keyboard_Controller(Node):
             "thumb_proximal_joint_r_1": 0.0,
         }
         
-        # Mevcut pozisyonlar (sıfırdan başla - control_right_arm.py gibi)
+        # Current positions (start from zero - like control_right_arm.py)
         self.current_positions = {name: 0.0 for name in self.joint_names}
 
-        # Hedef pozisyonlar: non-blocking yumuşak hareket için (tüm eklemler)
+        # Target positions: for non-blocking smooth movement (all joints)
         self.target_positions = self.current_positions.copy()
         
-        # Adım boyutu (radyan) - tuş başına hareket miktarı
+        # Step size (radians) - movement amount per key
         self.step_size = 0.01
         
-        # Maksimum hız (radyan/saniye) - mouse için hızlı tepki
+        # Maximum velocity (radians/second) - fast response for mouse
         self.max_velocity = 4.0  # 3.0 rad/s - daha hızlı!
         self.control_rate = 200  # Hz - 200Hz kontrol döngüsü (düşük gecikme)
         self.smooth_step = self.max_velocity / self.control_rate  # Her adımda maksimum hareket
 
-        # Parmaklar biraz daha hızlı olabilir: ayrı hız limiti
-        self.finger_max_velocity = 1.5  # rad/s - daha hızlı parmak hareketi
+        # Fingers can be slightly faster: separate speed limit
+        self.finger_max_velocity = 1.5  # rad/s - faster finger movement
         self.finger_smooth_step = self.finger_max_velocity / self.control_rate
 
-        # Effort/Kuvvet limitleri (Newton-metre)
-        # Parmaklar için düşük tork -> objeyi ezmez, fırlatmaz
-        self.finger_max_effort = 5.0   # Nm - parmaklar için (düşük tutun!)
-        self.arm_max_effort = 50.0     # Nm - kol joint'leri için
+        # Effort/Force limits (Newton-meters)
+        # Low torque for fingers -> doesn't crush object, doesn't throw
+        self.finger_max_effort = 5.0   # Nm - for fingers (keep low!)
+        self.arm_max_effort = 50.0     # Nm - for arm joints
 
-        # Non-blocking hareket güncelleyici (200Hz): current_positions -> target_positions
+        # Non-blocking motion updater (200Hz): current_positions -> target_positions
         self._motion_timer = self.create_timer(1.0 / self.control_rate, self._motion_update)
         
-        # Parmak joint'leri
+        # Finger joints
         self.finger_joints = [
             "index_proximal_joint_r",
             "middle_proximal_joint_r",
@@ -405,60 +405,60 @@ class Robot_Keyboard_Controller(Node):
             "thumb_joint_roll_r",
         ]
         
-        # Parmak pozisyonları (3 aşama)
+        # Finger positions (3 stages)
         self.finger_full_open = 0.1
         self.finger_half_closed = 1.0
         self.finger_full_closed = 3.0
         self.finger_state = 0
 
-        # Thumb roll toggle (tek tuşla aç/kapat)
-        # Not: thumb_joint_roll_r aynı zamanda (c/v) ile manuel +/- hareket ediyor.
-        # Toggle, non-blocking hedefe gider.
+        # Thumb roll toggle (single key open/close)
+        # Note: thumb_joint_roll_r also moves manually with (c/v) +/-.
+        # Toggle goes to non-blocking target.
         self.thumb_roll_open = -0.3
         self.thumb_roll_closed = 0.3
         self.thumb_roll_is_closed = False
 
-        # Thumb-first / gating için durum
+        # Thumb-first / gating status
         self._finger_gate_active = False
         self._finger_gate_target = None
         self._finger_gate_other_joints = []
         
-        # Klavye mapping (control_right_arm.py ile aynı)
+        # Keyboard mapping (same as control_right_arm.py)
         self.key_mappings = {
-            # Omuz
+            # Shoulder
             'a': ("right_shoulder_link_joint", +self.step_size),
             'w': ("right_shoulder_link_joint", -self.step_size),
             's': ("right_arm_top_link_joint", +self.step_size),
             'd': ("right_arm_top_link_joint", -self.step_size),
             
-            # Dirsek
+            # Elbow
             'e': ("right_arm_bottom_link_joint", +self.step_size),
             'r': ("right_arm_bottom_link_joint", -self.step_size),
             'f': ("right_forearm_link_joint", +self.step_size),
             't': ("right_forearm_link_joint", -self.step_size),
             
-            # Bilek
+            # Wrist
             'q': ("wrist_pitch_joint_r", +self.step_size),
             'y': ("wrist_pitch_joint_r", -self.step_size),
             'z': ("wrist_roll_joint_r", +self.step_size),
             'x': ("wrist_roll_joint_r", -self.step_size),
 
-            # Baş parmak roll (3x daha hızlı)
+            # Thumb roll (3x faster)
             'c': ("thumb_joint_roll_r", +self.step_size * 3),
             'v': ("thumb_joint_roll_r", -self.step_size * 3),
         }
         
-        # Mouse kontrol ayarları
+        # Mouse control settings
         self.mouse_enabled = False
-        self.mouse_sensitivity = 0.002  # radyan/pixel - daha hızlı kontrol
+        self.mouse_sensitivity = 0.002  # radians/pixel - faster control
         self.mouse_mode = 0  # 0: shoulder, 1: elbow, 2: wrist
-        self.mouse_mode_names = ['Shoulder (Omuz)', 'Elbow (Dirsek)', 'Wrist (Bilek)']
+        self.mouse_mode_names = ['Shoulder', 'Elbow', 'Wrist']
         
-        # Mouse ile kontrol edilecek joint'ler (mod başına)
+        # Joints to be controlled by mouse (per mode)
         self.mouse_joint_mappings = {
             0: {  # Shoulder mode
-                'x': 'right_shoulder_link_joint',  # Yatay hareket
-                'y': 'right_arm_top_link_joint',   # Dikey hareket
+                'x': 'right_shoulder_link_joint',  # Horizontal movement
+                'y': 'right_arm_top_link_joint',   # Vertical movement
             },
             1: {  # Elbow mode
                 'x': 'right_arm_bottom_link_joint',
@@ -470,35 +470,35 @@ class Robot_Keyboard_Controller(Node):
             },
         }
         
-        # Mouse listener başlat (eğer pynput varsa)
+        # Start mouse listener (if pynput exists)
         self.mouse_listener = None
         if MOUSE_AVAILABLE:
             self._setup_mouse_listener()
         
-        self.get_logger().info(f'Robot Keyboard Controller başlatıldı')
+        self.get_logger().info(f'Robot Keyboard Controller started')
         self.get_logger().info(f'Topic: {topic_name}')
-        self.get_logger().info(f'Joint sayısı: {len(self.joint_names)}')
+        self.get_logger().info(f'Number of joints: {len(self.joint_names)}')
         if MOUSE_AVAILABLE:
-            self.get_logger().info('🖱️  Mouse kontrolü hazır (M tuşu ile aç/kapat)')
+            self.get_logger().info('🖱️  Mouse control ready (Toggle with M)')
         
-        # Başlangıçta home pozisyonuna git
+        # Go to home position at start
         self.send_command()
     
     def _setup_mouse_listener(self):
-        """Mouse listener'ı başlat"""
+        """Start mouse listener"""
         global mouse_delta_x, mouse_delta_y, mouse_left_button, mouse_right_button, mouse_middle_button
         
         def on_move(x, y):
             global mouse_last_x, mouse_last_y, mouse_delta_x, mouse_delta_y
             if self.mouse_enabled:
-                # Kilitleme pozisyonundan itibaren delta hesapla (birikimli DEĞİL)
+                # Calculate delta from lock position (NOT cumulative)
                 if hasattr(self, 'lock_position') and self.lock_position and mouse_controller:
-                    # Delta = mevcut pozisyon - kilit pozisyonu (doğrudan, biriktirme yok)
+                    # Delta = current pos - lock pos (direct, no accumulation)
                     mouse_delta_x = x - self.lock_position[0]
                     mouse_delta_y = y - self.lock_position[1]
-                    # İmleci geri gönder
+                    # Send cursor back
                     mouse_controller.position = self.lock_position
-                    # Last pozisyonu kilit pozisyonuna ayarla
+                    # Set Last position to lock position
                     mouse_last_x, mouse_last_y = self.lock_position
                     return
                 else:
@@ -517,14 +517,14 @@ class Robot_Keyboard_Controller(Node):
                 mouse_middle_button = pressed
         
         def on_scroll(x, y, dx, dy):
-            # Scroll ile hassasiyet ayarla
+            # Adjust sensitivity with Scroll
             global mouse_sensitivity
             if self.mouse_enabled:
                 if dy > 0:
                     self.mouse_sensitivity = min(0.005, self.mouse_sensitivity * 1.2)
                 else:
                     self.mouse_sensitivity = max(0.00005, self.mouse_sensitivity / 1.2)
-                print(f"🖱️  Mouse hassasiyeti: {self.mouse_sensitivity:.5f}")
+                print(f"🖱️  Mouse sensitivity: {self.mouse_sensitivity:.5f}")
         
         try:
             self.mouse_listener = mouse.Listener(
@@ -533,13 +533,13 @@ class Robot_Keyboard_Controller(Node):
                 on_scroll=on_scroll
             )
             self.mouse_listener.start()
-            self.get_logger().info('🖱️  Mouse listener başlatıldı')
+            self.get_logger().info('🖱️  Mouse listener started')
         except Exception as e:
-            self.get_logger().warning(f'Mouse listener başlatılamadı: {e}')
+            self.get_logger().warning(f'Mouse listener could not start: {e}')
             self.mouse_listener = None
     
     def toggle_mouse_control(self):
-        """Mouse kontrolünü aç/kapat - aktifken imleç sağ alt köşeye kilitlenir"""
+        """Toggle mouse control - cursor locked to bottom right when active"""
         global mouse_delta_x, mouse_delta_y
         self.mouse_enabled = not self.mouse_enabled
         mouse_delta_x = 0
@@ -550,26 +550,26 @@ class Robot_Keyboard_Controller(Node):
             if mouse_controller:
                 self.lock_position = (SCREEN_WIDTH - 50, SCREEN_HEIGHT - 50)
                 mouse_controller.position = self.lock_position
-            print(f"\n🖱️  MOUSE KONTROL AKTİF - Mod: {self.mouse_mode_names[self.mouse_mode]}")
-            print(f"    🔒 İmleç sağ alt köşeye kilitlendi ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
-            print("    Sol tık: Parmak kapat | Sağ tık: Parmak aç | Orta tık: Mod değiştir")
-            print("    Scroll: Hassasiyet ayarla | M: Mouse kapat")
+            print(f"\n🖱️  MOUSE CONTROL ACTIVE - Mode: {self.mouse_mode_names[self.mouse_mode]}")
+            print(f"    🔒 Cursor locked to bottom right ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
+            print("    Left Click: Close fingers | Right Click: Open fingers | Middle Click: Change mode")
+            print("    Scroll: Adjust sensitivity | M: Disable mouse")
         else:
             self.lock_position = None
             print("\n⌨️  Klavye kontrolüne dönüldü - İmleç serbest")
     
     def cycle_mouse_mode(self):
-        """Mouse kontrol modunu değiştir (Shoulder -> Elbow -> Wrist)"""
+        """Change mouse control mode (Shoulder -> Elbow -> Wrist)"""
         self.mouse_mode = (self.mouse_mode + 1) % 3
-        print(f"🖱️  Mouse modu: {self.mouse_mode_names[self.mouse_mode]}")
+        print(f"🖱️  Mouse mode: {self.mouse_mode_names[self.mouse_mode]}")
     
     def process_mouse_input(self):
-        """FPS TARZI Mouse kontrolü - SİMÜLASYONDAKİ GERÇEK POZİSYONU KULLAN
+        """FPS STYLE Mouse control - USE REAL SIMULATION POSITION
         
-        Birikme YOK çünkü:
-        - Her komutta simülasyonun GERÇEK pozisyonunu oku (/joint_states)
-        - O pozisyona delta ekle
-        - Simülasyon yetişemediyse önemli değil, hep güncel pozisyondan başlıyoruz
+        NO accumulation because:
+        - Read ACTUAL simulation position at every command (/joint_states)
+        - Add delta to that position
+        - If simulation lags, it doesn't matter, we always start from current position
         """
         global mouse_delta_x, mouse_delta_y, mouse_left_button, mouse_right_button, mouse_middle_button
         global joint_states
@@ -577,40 +577,40 @@ class Robot_Keyboard_Controller(Node):
         if not self.mouse_enabled:
             return
         
-        # Delta'yı AL ve HEMEN SIFIRLA
+        # Get Delta and RESET IMMEDIATELY
         dx = mouse_delta_x
         dy = mouse_delta_y
         mouse_delta_x = 0
         mouse_delta_y = 0
         
-        # Simülasyondan GERÇEK pozisyonları al
+        # Get ACTUAL positions from simulation
         actual_positions = {}
         if len(joint_states['names']) > 0 and len(joint_states['positions']) > 0:
             actual_positions = dict(zip(joint_states['names'], joint_states['positions']))
         
-        # Hareket mapping
+        # Movement mapping
         mapping = self.mouse_joint_mappings.get(self.mouse_mode, {})
         
-        # X ekseni
+        # X axis
         if 'x' in mapping and abs(dx) > 0:
             joint_name = mapping['x']
-            # GERÇEK pozisyonu al (simülasyondan)
+            # Get ACTUAL position (from simulation)
             if joint_name in actual_positions:
                 real_pos = actual_positions[joint_name]
             else:
                 real_pos = self.current_positions.get(joint_name, 0)
             
-            # Delta hesapla ve sınırla (FPS sensitivity)
-            max_move = 0.1  # radyan - tek seferde maksimum
+            # Calculate Delta and limit (FPS sensitivity)
+            max_move = 0.1  # radians - max per single frame
             delta = dx * self.mouse_sensitivity
             delta = max(-max_move, min(max_move, delta))
             
-            # Yeni hedef = GERÇEK pozisyon + delta
+            # New target = ACTUAL position + delta
             new_pos = real_pos + delta
             self.current_positions[joint_name] = new_pos
             self.target_positions[joint_name] = new_pos
         
-        # Y ekseni
+        # Y axis
         if 'y' in mapping and abs(dy) > 0:
             joint_name = mapping['y']
             if joint_name in actual_positions:
@@ -626,7 +626,7 @@ class Robot_Keyboard_Controller(Node):
             self.current_positions[joint_name] = new_pos
             self.target_positions[joint_name] = new_pos
         
-        # Sol tık: parmakları kapat
+        # Left click: close fingers
         if mouse_left_button:
             for joint in self.finger_joints:
                 if joint != 'thumb_joint_roll_r':
@@ -639,7 +639,7 @@ class Robot_Keyboard_Controller(Node):
                         self.current_positions[joint] = new_pos
                         self.target_positions[joint] = new_pos
         
-        # Sağ tık: parmakları aç
+        # Right click: open fingers
         if mouse_right_button:
             for joint in self.finger_joints:
                 if joint != 'thumb_joint_roll_r':
@@ -652,36 +652,36 @@ class Robot_Keyboard_Controller(Node):
                         self.current_positions[joint] = new_pos
                         self.target_positions[joint] = new_pos
         
-        # Komut gönder
+        # Send command
         self.send_command()
     
     def toggle_mouse_control(self):
-        """Mouse kontrolünü aç/kapat - aktifken imleç sağ alt köşeye kilitlenir"""
+        """Toggle mouse control - cursor locked to bottom right when active"""
         global mouse_delta_x, mouse_delta_y
         self.mouse_enabled = not self.mouse_enabled
         mouse_delta_x = 0
         mouse_delta_y = 0
         
         if self.mouse_enabled:
-            # Baz pozisyonları sıfırla (yeni oturum)
+            # Reset base positions (new session)
             if hasattr(self, '_mouse_base_positions'):
                 del self._mouse_base_positions
             
-            # İmleci sağ alt köşeye taşı
+            # Move cursor to bottom right
             if mouse_controller:
                 self.lock_position = (SCREEN_WIDTH - 50, SCREEN_HEIGHT - 50)
                 mouse_controller.position = self.lock_position
-            print(f"\n🖱️  MOUSE KONTROL AKTİF - Mod: {self.mouse_mode_names[self.mouse_mode]}")
-            print(f"    🔒 İmleç sağ alt köşeye kilitlendi ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
-            print("    Sol tık: Parmak kapat | Sağ tık: Parmak aç | Orta tık: Mod değiştir")
-            print("    Scroll: Hassasiyet ayarla | M: Mouse kapat")
+            print(f"\n🖱️  MOUSE CONTROL ACTIVE - Mode: {self.mouse_mode_names[self.mouse_mode]}")
+            print(f"    🔒 Cursor locked to bottom right ({SCREEN_WIDTH-50}, {SCREEN_HEIGHT-50})")
+            print("    Left Click: Close fingers | Right Click: Open fingers | Middle Click: Change mode")
+            print("    Scroll: Adjust sensitivity | M: Disable mouse")
         else:
             self.lock_position = None
-            print("\n⌨️  Klavye kontrolüne dönüldü - İmleç serbest")
+            print("\n⌨️  Returned to keyboard control - Cursor free")
     
     def _motion_update(self):
-        """Non-blocking hareket: hedefe max_velocity ile yaklaş ve komut gönder."""
-        # Mouse input'u işle
+        """Non-blocking movement: approach target with max_velocity and send command."""
+        # Process Mouse input
         self.process_mouse_input()
         
         moved = False
@@ -691,7 +691,7 @@ class Robot_Keyboard_Controller(Node):
             diff = target - current
 
             if abs(diff) > 0.001:
-                # Parmaklarda ayrı hız limiti uygula
+                # Apply separate speed limit for fingers
                 max_step = self.finger_smooth_step if joint_name in self.finger_joints else self.smooth_step
                 step = max_step if abs(diff) > max_step else abs(diff)
                 self.current_positions[joint_name] = current + (step if diff > 0 else -step)
@@ -700,7 +700,7 @@ class Robot_Keyboard_Controller(Node):
                 # Snap to exact target if very close
                 self.current_positions[joint_name] = target
 
-        # Thumb hedefe ulaştıysa diğer parmak hedeflerini devreye al
+        # If Thumb reached target, activate other finger targets
         if self._finger_gate_active and self._finger_gate_target is not None:
             if self._thumb_at_target(self._finger_gate_target):
                 if self._finger_gate_other_joints:
@@ -709,12 +709,12 @@ class Robot_Keyboard_Controller(Node):
                 self._finger_gate_target = None
                 self._finger_gate_other_joints = []
 
-        # Sürekli publish etmeyelim: sadece hareket varken gönder
+        # Don't publish continuously: only send when there is movement
         if moved:
             self.send_command()
 
     def _thumb_at_target(self, target, tol=0.03):
-        """Thumb eklemleri hedef pozisyona yeterince yaklaştı mı?"""
+        """Are thumb joints close enough to target position?"""
         thumb_joints = [
             'thumb_joint_roll_r',
             'thumb_proximal_joint_r',
@@ -728,23 +728,23 @@ class Robot_Keyboard_Controller(Node):
         return True
         
     def update_position(self, joint_name, delta):
-        """Joint pozisyonunu güncelle ve komut gönder"""
+        """Update joint position and send command"""
         global action
         if joint_name not in self.current_positions:
-            print(f'HATA: Bilinmeyen joint: {joint_name}')
+            print(f'ERROR: Unknown joint: {joint_name}')
             return
         
-        # Pozisyonu güncelle (tuş başına step_size kadar) -> hedefi güncelle (non-blocking)
+        # Update position (step_size per key) -> update target (non-blocking)
         self.target_positions[joint_name] = self.target_positions.get(joint_name, self.current_positions[joint_name]) + delta
 
     def move_smooth(self, target_positions_dict):
-        """(Non-blocking) hedef pozisyonları güncelle. Hareket timer ile gerçekleşir."""
+        """(Non-blocking) update target positions. Movement happens via timer."""
         for joint_name, target in target_positions_dict.items():
             if joint_name in self.target_positions:
                 self.target_positions[joint_name] = float(target)
     
     def send_command(self):
-        """Mevcut pozisyonları komut olarak gönder"""
+        """Send current positions as command"""
         global action
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -753,15 +753,15 @@ class Robot_Keyboard_Controller(Node):
         msg.name = list(self.joint_names)
         msg.position = [self.current_positions[name] for name in self.joint_names]
         msg.velocity = [0.0] * len(self.joint_names)
-        msg.effort = [0.0] * len(self.joint_names)  # Effort sıfır - position control
+        msg.effort = [0.0] * len(self.joint_names)  # Effort zero - position control
         
-        # Action'ı güncelle (veri kaydı için)
+        # Update Action (for data recording)
         action = np.array(msg.position, dtype=float)
         
         self.publisher.publish(msg)
     
     def cycle_fingers(self):
-        """Parmakları 3 aşamada döngüye al"""
+        """Cycle fingers in 3 stages"""
         self.finger_state = (self.finger_state + 1) % 3
         
         if self.finger_state == 0:
@@ -771,8 +771,8 @@ class Robot_Keyboard_Controller(Node):
         else:
             position = self.finger_full_closed
         
-        # Non-blocking: hedefleri ayarla, hareket timer ile gerçekleşir.
-        # İstek: thumb kapanmadan diğer parmaklar kapanmasın => gating.
+        # Non-blocking: set targets, movement happens via timer.
+        # Request: Other fingers shouldn't close before thumb closes => gating.
         thumb_joints = [
             'thumb_joint_roll_r',
             'thumb_proximal_joint_r',
@@ -783,20 +783,20 @@ class Robot_Keyboard_Controller(Node):
 
         closing = position > self.finger_full_open + 1e-6
         if closing and thumb_joints and other_finger_joints:
-            # Önce thumb hedefleri; diğerlerini, thumb hedefe gelince devreye al
+            # First thumb targets; trigger others when thumb reaches target
             self.move_smooth({j: position for j in thumb_joints})
             self._finger_gate_active = True
             self._finger_gate_target = float(position)
             self._finger_gate_other_joints = other_finger_joints
         else:
-            # Açarken veya thumb yoksa: hepsi birlikte
+            # When opening or no thumb: all together
             self._finger_gate_active = False
             self._finger_gate_target = None
             self._finger_gate_other_joints = []
             self.move_smooth({j: position for j in self.finger_joints})
 
     def toggle_thumb_roll(self):
-        """Thumb roll jointini tek tuşla aç/kapat (non-blocking)."""
+        """Toggle thumb roll joint with single key (non-blocking)."""
         self.thumb_roll_is_closed = not self.thumb_roll_is_closed
         target = self.thumb_roll_closed if self.thumb_roll_is_closed else self.thumb_roll_open
         self.move_smooth({'thumb_joint_roll_r': target})
@@ -804,17 +804,17 @@ class Robot_Keyboard_Controller(Node):
         print(f"👍 Thumb roll toggle -> {state} (target={target:.3f} rad)")
     
     def home(self):
-        """Tüm joint'leri home pozisyonuna yavaşça al (max 0.2 rad/s)"""
-        print("🏠 Home pozisyonuna gidiliyor...")
-        # Non-blocking: hedefleri ayarla, hareket timer ile gerçekleşecek
+        """Move all joints to home position slowly (max 0.2 rad/s)"""
+        print("🏠 Going to Home position...")
+        # Non-blocking: set targets, movement will happen via timer
         self.move_smooth(self.home_positions)
         self.finger_state = 0
-        print("🏠 Home hedefi set edildi (non-blocking)")
+        print("🏠 Home target set (non-blocking)")
     
     def show_positions(self):
-        """Mevcut pozisyonları göster"""
+        """Show current positions"""
         print("\n" + "="*60)
-        print("MEVCUT JOINT POZİSYONLARI")
+        print("CURRENT JOINT POSITIONS")
         print("="*60)
         for joint_name in self.joint_names:
             print(f"  {joint_name:30s}: {self.current_positions[joint_name]:7.3f} rad")
@@ -831,15 +831,15 @@ class JointStates_Subscriber(Node):
             self.joint_states_callback,
             10)
         self.subscription
-        self.get_logger().info('🔍 Joint States Subscriber başlatıldı - /joint_states topic dinleniyor...')
+        self.get_logger().info('🔍 Joint States Subscriber started - listening to /joint_states topic...')
     
     def joint_states_callback(self, data):
         global joint_states
         joint_states['names'] = list(data.name)
         joint_states['positions'] = np.array(data.position, dtype=float)
-        # Debug: İlk veri geldiğinde log
+        # Debug: Log when first data arrives
         if len(joint_states['positions']) > 0:
-            self.get_logger().info(f'✅ Joint states alındı: {len(joint_states["positions"])} joint, ilk 3: {joint_states["positions"][:3]}', once=True)
+            self.get_logger().info(f'✅ Joint states received: {len(joint_states["positions"])} joints, first 3: {joint_states["positions"][:3]}', once=True)
 
 class RGB_Camera_Subscriber(Node):
     """Subscribe to /rgb topic for camera image"""
@@ -926,7 +926,7 @@ class Data_Recorder(Node):
 
         # Detect existing episodes and set next episode index
         self.episode_index, self.index = self._detect_last_episode()
-        print(f"📊 Mevcut episode sayısı: {self.episode_index}, Sonraki index: {self.index}")
+        print(f"📊 Current episode count: {self.episode_index}, Next index: {self.index}")
 
         self.df = pd.DataFrame(columns=['observation.state', 'action', 'episode_index', 'frame_index', 'timestamp', 'index', 'task_index'])
         self.frame_index = 0
@@ -943,19 +943,19 @@ class Data_Recorder(Node):
         self._load_existing_meta()
 
     def _detect_last_episode(self):
-        """Mevcut parquet dosyalarından son episode numarasını tespit et"""
+        """Detect last episode number from existing parquet files"""
         import glob
         
-        # data/chunk-000/ içindeki parquet dosyalarını bul
+        # Find parquet files in data/chunk-000/
         parquet_files = glob.glob(os.path.join(self.log_dir, "*.parquet"))
         
         if not parquet_files:
-            # Eski format kontrolü (chunk_000 klasörü)
+            # Old format check (chunk_000 folder)
             old_log_dir = os.path.join(self.base_dir, "data/chunk_000/")
             parquet_files = glob.glob(os.path.join(old_log_dir, "*.parquet"))
         
         if not parquet_files:
-            return 0, 0  # Hiç episode yok, 0'dan başla
+            return 0, 0  # No episodes, start from 0
         
         max_episode = -1
         max_index = 0
@@ -972,7 +972,7 @@ class Data_Recorder(Node):
                     if idx_max > max_index:
                         max_index = idx_max
             except Exception as e:
-                print(f"⚠ Parquet okuma hatası: {pf} - {e}")
+                print(f"⚠ Parquet read error: {pf} - {e}")
                 continue
         
         next_episode = max_episode + 1 if max_episode >= 0 else 0
@@ -981,7 +981,7 @@ class Data_Recorder(Node):
         return next_episode, next_index
 
     def _load_existing_meta(self):
-        """Mevcut meta dosyalarını yükle"""
+        """Load existing meta files"""
         info_path = os.path.join(self.meta_dir, "info.json")
         if os.path.exists(info_path):
             try:
@@ -989,7 +989,7 @@ class Data_Recorder(Node):
                 with open(info_path, 'r') as f:
                     info = json.load(f)
                     self.total_frames = info.get('total_frames', 0)
-                    print(f"📂 Mevcut meta yüklendi: {info.get('total_episodes', 0)} episode, {self.total_frames} frame")
+                    print(f"📂 Existing meta loaded: {info.get('total_episodes', 0)} episodes, {self.total_frames} frames")
             except Exception as e:
                 print(f"⚠ Meta yükleme hatası: {e}")
         
@@ -999,9 +999,9 @@ class Data_Recorder(Node):
             try:
                 episodes_df = pd.read_parquet(episodes_parquet)
                 self.all_episodes_meta = episodes_df.to_dict('records')
-                print(f"📂 Mevcut episodes meta yüklendi: {len(self.all_episodes_meta)} episode")
+                print(f"📂 Existing episodes meta loaded: {len(self.all_episodes_meta)} episodes")
             except Exception as e:
-                print(f"⚠ Episodes meta yükleme hatası: {e}")
+                print(f"⚠ Episodes meta load error: {e}")
 
     def timer_callback(self):
         global action, wrist_camera_image, top_camera_image, rgb_image, joint_states, record_data
@@ -1054,31 +1054,31 @@ class Data_Recorder(Node):
                 
                 # Check observation_state
                 if len(observation_state) == 0:
-                    print('\033[33m'+'⚠️  WARNING: observation_state BOŞ! /joint_states topic\'i veri göndermiyor olabilir!'+'\033[0m')
+                    print('\033[33m'+'⚠️  WARNING: observation_state EMPTY! /joint_states topic might not be sending data!'+'\033[0m')
                 elif np.allclose(observation_state, 0.0):
-                    print('\033[33m'+'⚠️  WARNING: observation_state tümü 0.0! Joint states doğru gelmiyor olabilir!'+'\033[0m')
+                    print('\033[33m'+'⚠️  WARNING: observation_state all 0.0! Joint states might not be coming correctly!'+'\033[0m')
                     print(f'   observation_state: {observation_state}')
                 else:
-                    print('\033[32m'+f'✅ observation_state OK: {len(observation_state)} joint'+'\033[0m')
-                    print(f'   İlk 5 değer: {[f"{v:.4f}" for v in observation_state[:5]]}')
+                    print('\033[32m'+f'✅ observation_state OK: {len(observation_state)} joints'+'\033[0m')
+                    print(f'   First 5 values: {[f"{v:.4f}" for v in observation_state[:5]]}')
                     non_zero_count = sum(1 for v in observation_state if abs(v) > 0.001)
-                    print(f'   Sıfır olmayan joint sayısı: {non_zero_count}/{len(observation_state)}')
+                    print(f'   Non-zero joint count: {non_zero_count}/{len(observation_state)}')
                 
                 # Check action
                 if len(action_to_save) == 0:
-                    print('\033[33m'+'⚠️  WARNING: action BOŞ!'+'\033[0m')
+                    print('\033[33m'+'⚠️  WARNING: action EMPTY!'+'\033[0m')
                 else:
-                    print('\033[32m'+f'✅ action OK: {len(action_to_save)} joint'+'\033[0m')
-                    print(f'   İlk 5 değer: {[f"{v:.4f}" for v in action_to_save[:5]]}')
+                    print('\033[32m'+f'✅ action OK: {len(action_to_save)} joints'+'\033[0m')
+                    print(f'   First 5 values: {[f"{v:.4f}" for v in action_to_save[:5]]}')
                     non_zero_count = sum(1 for v in action_to_save if abs(v) > 0.001)
-                    print(f'   Sıfır olmayan joint sayısı: {non_zero_count}/{len(action_to_save)}')
+                    print(f'   Non-zero joint count: {non_zero_count}/{len(action_to_save)}')
                 
                 # Check raw joint_states data
                 if len(joint_states['names']) > 0:
                     print(f'\n📊 Raw /joint_states topic:')
-                    print(f'   Toplam joint sayısı: {len(joint_states["names"])}')
-                    print(f'   İlk 3 joint: {joint_states["names"][:3]}')
-                    print(f'   İlk 3 pozisyon: {[f"{v:.4f}" for v in joint_states["positions"][:3]]}')
+                    print(f'   Total joint count: {len(joint_states["names"])}')
+                    print(f'   First 3 joints: {joint_states["names"][:3]}')
+                    print(f'   First 3 positions: {[f"{v:.4f}" for v in joint_states["positions"][:3]]}')
                 
                 print('='*70 + '\n')
             
@@ -1209,12 +1209,11 @@ class Data_Recorder(Node):
         self.all_episodes_meta.append(episode_meta)
         self.total_frames += episode_length
         
-        print(f"📝 Episode {self.episode_index} metadata kaydedildi: {episode_length} frame")
+        print(f"📝 Episode {self.episode_index} metadata saved: {episode_length} frames")
 
     def _generate_meta_files(self):
-        """LeRobot v2.1 formatında tüm meta dosyalarını oluştur (JSONL based)"""
+        """Generate all meta files in LeRobot v3.0 format"""
         import json
-        import glob
         
         # Joint isimleri (observation.state ve action için)
         joint_names = [
@@ -1237,98 +1236,17 @@ class Data_Recorder(Node):
             "thumb_proximal_joint_r_1",
         ]
         
-        # Compute real statistics from all parquet files
-        all_obs_states = []
-        all_actions = []
-        episode_stats_list = []
-        
-        parquet_files = sorted(glob.glob(os.path.join(self.log_dir, "*.parquet")))
-        for pf in parquet_files:
-            try:
-                df = pd.read_parquet(pf)
-                ep_idx = df['episode_index'].iloc[0] if 'episode_index' in df.columns else 0
-                
-                # Extract observation.state and action arrays
-                obs_data = np.array([np.array(x) for x in df['observation.state'].values])
-                act_data = np.array([np.array(x) for x in df['action'].values])
-                
-                all_obs_states.append(obs_data)
-                all_actions.append(act_data)
-                
-                # Per-episode stats
-                ep_stats = {
-                    "episode_index": int(ep_idx),
-                    "stats": {
-                        "observation.state": {
-                            "min": obs_data.min(axis=0).tolist(),
-                            "max": obs_data.max(axis=0).tolist(),
-                            "mean": obs_data.mean(axis=0).tolist(),
-                            "std": obs_data.std(axis=0).tolist()
-                        },
-                        "action": {
-                            "min": act_data.min(axis=0).tolist(),
-                            "max": act_data.max(axis=0).tolist(),
-                            "mean": act_data.mean(axis=0).tolist(),
-                            "std": act_data.std(axis=0).tolist()
-                        }
-                    }
-                }
-                episode_stats_list.append(ep_stats)
-            except Exception as e:
-                print(f"⚠ Stats hesaplama hatası {pf}: {e}")
-        
-        # Global stats from all data
-        if all_obs_states:
-            all_obs = np.vstack(all_obs_states)
-            all_act = np.vstack(all_actions)
-            global_stats = {
-                "observation.state": {
-                    "min": all_obs.min(axis=0).tolist(),
-                    "max": all_obs.max(axis=0).tolist(),
-                    "mean": all_obs.mean(axis=0).tolist(),
-                    "std": all_obs.std(axis=0).tolist(),
-                    "count": len(all_obs)
-                },
-                "action": {
-                    "min": all_act.min(axis=0).tolist(),
-                    "max": all_act.max(axis=0).tolist(),
-                    "mean": all_act.mean(axis=0).tolist(),
-                    "std": all_act.std(axis=0).tolist(),
-                    "count": len(all_act)
-                }
-            }
-        else:
-            # Fallback if no data
-            global_stats = {
-                "observation.state": {
-                    "min": [-3.14] * len(joint_names),
-                    "max": [3.14] * len(joint_names),
-                    "mean": [0.0] * len(joint_names),
-                    "std": [1.0] * len(joint_names),
-                    "count": self.total_frames
-                },
-                "action": {
-                    "min": [-3.14] * len(joint_names),
-                    "max": [3.14] * len(joint_names),
-                    "mean": [0.0] * len(joint_names),
-                    "std": [1.0] * len(joint_names),
-                    "count": self.total_frames
-                }
-            }
-        
-        # 1. info.json (v2.1 format)
+        # 1. info.json
         info = {
-            "codebase_version": "v2.1",
+            "codebase_version": "v3.0",
             "robot_type": "r1_humanoid",
             "total_episodes": len(self.all_episodes_meta),
             "total_frames": self.total_frames,
             "total_tasks": 1,
-            "total_chunks": 1,
-            "chunks_size": 1000,
             "fps": self.Hz,
             "splits": {"train": f"0:{len(self.all_episodes_meta)}"},
-            "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-            "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
             "features": {
                 "observation.state": {
                     "dtype": "float32",
@@ -1380,52 +1298,51 @@ class Data_Recorder(Node):
             }
         }
         
-        print(f"ℹ️  Dataset format: LeRobot v2.1 (JSONL based)")
+        print(f"ℹ️  Dataset format: observation.state + action (no reward/done/success)")
         
         info_path = os.path.join(self.meta_dir, "info.json")
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=4, ensure_ascii=False)
-        print(f"✅ info.json oluşturuldu (v2.1)")
+        print(f"✅ info.json created")
         
-        # 2. tasks.jsonl (v2.1 format - JSONL instead of parquet)
-        tasks_path = os.path.join(self.meta_dir, "tasks.jsonl")
-        with open(tasks_path, 'w') as f:
-            task_entry = {"task_index": 0, "task": "robot_arm_control"}
-            f.write(json.dumps(task_entry) + "\n")
-        print(f"✅ tasks.jsonl oluşturuldu")
+        # 2. tasks.parquet
+        tasks_df = pd.DataFrame({
+            "task_index": [0],
+        }, index=["robot_arm_control"])
+        tasks_path = os.path.join(self.meta_dir, "tasks.parquet")
+        tasks_df.to_parquet(tasks_path)
+        print(f"✅ tasks.parquet created")
         
-        # 3. episodes.jsonl (v2.1 format - JSONL instead of parquet)
-        episodes_path = os.path.join(self.meta_dir, "episodes.jsonl")
-        with open(episodes_path, 'w') as f:
-            for ep_meta in self.all_episodes_meta:
-                episode_entry = {
-                    "episode_index": ep_meta["episode_index"],
-                    "tasks": [0],  # task_index as integer
-                    "length": ep_meta["length"]
-                }
-                f.write(json.dumps(episode_entry) + "\n")
-        print(f"✅ episodes.jsonl oluşturuldu: {len(self.all_episodes_meta)} episode")
+        # 3. episodes/chunk-000/file-000.parquet
+        if self.all_episodes_meta:
+            episodes_df = pd.DataFrame(self.all_episodes_meta)
+            episodes_path = os.path.join(self.episodes_meta_dir, "file-000.parquet")
+            episodes_df.to_parquet(episodes_path, index=False)
+            print(f"✅ episodes meta parquet created: {len(self.all_episodes_meta)} episodes")
         
-        # 4. episodes_stats.jsonl (v2.1 - per-episode statistics)
-        episodes_stats_path = os.path.join(self.meta_dir, "episodes_stats.jsonl")
-        with open(episodes_stats_path, 'w') as f:
-            for ep_stats in episode_stats_list:
-                f.write(json.dumps(ep_stats) + "\n")
-        print(f"✅ episodes_stats.jsonl oluşturuldu")
-        
-        # 5. stats.json (global statistics - computed from real data)
+        # 4. stats.json (basit istatistikler - joint isimleriyle)
+        stats = {
+            "observation.state": {
+                "min": {name: -3.14 for name in joint_names},
+                "max": {name: 3.14 for name in joint_names},
+                "mean": {name: 0.0 for name in joint_names},
+                "std": {name: 1.0 for name in joint_names},
+                "count": self.total_frames
+            },
+            "action": {
+                "min": {name: -3.14 for name in joint_names},
+                "max": {name: 3.14 for name in joint_names},
+                "mean": {name: 0.0 for name in joint_names},
+                "std": {name: 1.0 for name in joint_names},
+                "count": self.total_frames
+            }
+        }
         stats_path = os.path.join(self.meta_dir, "stats.json")
         with open(stats_path, 'w') as f:
-            json.dump(global_stats, f, indent=4, ensure_ascii=False)
-        print(f"✅ stats.json oluşturuldu (gerçek veriden hesaplandı)")
+            json.dump(stats, f, indent=4, ensure_ascii=False)
+        print(f"✅ stats.json created")
         
-        # Cleanup old parquet meta files if they exist
-        old_tasks_parquet = os.path.join(self.meta_dir, "tasks.parquet")
-        if os.path.exists(old_tasks_parquet):
-            os.remove(old_tasks_parquet)
-            print(f"🗑️  Eski tasks.parquet silindi")
-        
-        print(f"🎉 Tüm meta dosyaları oluşturuldu! Toplam: {len(self.all_episodes_meta)} episode, {self.total_frames} frame")
+        print(f"🎉 All meta files created! Total: {len(self.all_episodes_meta)} episodes, {self.total_frames} frames")
 
     def reset_robot_after_episode(self):
         """Placeholder: post-episode reset removed (no /joint_trajectory topic)."""
@@ -1433,7 +1350,7 @@ class Data_Recorder(Node):
 
 
 def interactive_control(controller):
-    """İnteraktif klavye + mouse kontrolü"""
+    """Interactive keyboard + mouse control"""
     global record_data, mouse_middle_button
     
     print("\n" + "="*70)
@@ -1441,7 +1358,7 @@ def interactive_control(controller):
     print("="*70)
     print(f"\nROS2 Topic: /joint_command")
     print(f"Controlled joints: {len(controller.joint_names)}")
-    print("\n⌨️  KLAVYE KONTROL:")
+    print("\n⌨️  KEYBOARD CONTROL:")
     print("  Shoulder:")
     print("    a / w  -> right_shoulder_link_joint (+/- 0.01 rad)")
     print("    s / d  -> right_arm_top_link_joint (+/- 0.01 rad)")
@@ -1455,19 +1372,19 @@ def interactive_control(controller):
     print("    b      -> thumb_joint_roll_r toggle open/close")
     print("  Fingers (3-step cycle):")
     print("    g -> Cycle: Full open -> Half closed -> Full closed")
-    print("\n🖱️  MOUSE KONTROL:")
+    print("\n🖱️  MOUSE CONTROL:")
     if MOUSE_AVAILABLE:
-        print("    m      -> Mouse kontrolü aç/kapat")
-        print("    n      -> Mouse modu değiştir (Shoulder/Elbow/Wrist)")
-        print("    (Mouse aktifken:)")
-        print("      Hareket    -> Seçili joint'leri kontrol et")
-        print("      Sol tık    -> Parmakları kapat")
-        print("      Sağ tık    -> Parmakları aç")
-        print("      Orta tık   -> Mod değiştir")
-        print("      Scroll     -> Hassasiyet ayarla")
+        print("    m      -> Toggle mouse control")
+        print("    n      -> Change mouse mode (Shoulder/Elbow/Wrist)")
+        print("    (When mouse active:)")
+        print("      Movement   -> Control selected joints")
+        print("      Left Click -> Close fingers")
+        print("      Right Click-> Open fingers")
+        print("      Middle Click-> Change mode")
+        print("      Scroll     -> Adjust sensitivity")
     else:
-        print("    ⚠ pynput modülü yüklü değil. Mouse kontrolü kullanılamaz.")
-        print("    Yüklemek için: pip install pynput")
+        print("    ⚠ pynput module not installed. Mouse control unavailable.")
+        print("    To install: pip install pynput")
     print("\n  Recording:")
     print("    SPACE -> Start/Stop Recording")
     print("\n  Other:")
@@ -1477,7 +1394,7 @@ def interactive_control(controller):
     print("\n" + "-"*70)
     print("Press any key to start...\n")
     
-    # ROS2 bağlantısını test et
+    # Test ROS2 connection
     time.sleep(0.5)
     try:
         test_msg = JointState()
@@ -1497,17 +1414,17 @@ def interactive_control(controller):
     
     while rclpy.ok():
         try:
-            # Aynı anda basılan tüm tuşları al
+            # Get all keys pressed instantaneously
             keys = get_all_keys()
             
             for key in keys:
-                # ESC ile çıkış
+                # Exit with ESC
                 if ord(key) == 27:
-                    print("\nÇıkılıyor...")
+                    print("\nExiting...")
                     rclpy.shutdown()
                     return
                 
-                # SPACE ile kayıt başlat/durdur
+                # Start/Stop recording with SPACE
                 if key == ' ':
                     push_time = time.time()
                     dif = push_time - prev_push_time
@@ -1523,7 +1440,7 @@ def interactive_control(controller):
                 
                 key_lower = key.lower()
                 
-                # Özel komutlar
+                # Special commands
                 if key_lower == 'h':
                     controller.home()
                     continue
@@ -1532,39 +1449,39 @@ def interactive_control(controller):
                     controller.show_positions()
                     continue
                 
-                # Parmak kontrolleri (3 aşama)
+                # Finger controls (3 stages)
                 if key_lower == 'g':
                     controller.cycle_fingers()
                     continue
 
-                # Thumb-roll aç/kapat tek tuş
+                # Thumb-roll toggle open/close
                 if key_lower == 'b':
                     controller.toggle_thumb_roll()
                     continue
                 
-                # Mouse kontrolü aç/kapat
+                # Toggle mouse control
                 if key_lower == 'm' and MOUSE_AVAILABLE:
                     controller.toggle_mouse_control()
                     continue
                 
-                # Mouse modu değiştir
+                # Change mouse mode
                 if key_lower == 'n' and MOUSE_AVAILABLE and controller.mouse_enabled:
                     controller.cycle_mouse_mode()
                     continue
                 
-                # Orta tık ile mouse modu değiştir (mouse aktifken)
+                # Change mode with Middle click (when mouse active)
                 if mouse_middle_button and MOUSE_AVAILABLE and controller.mouse_enabled:
                     mouse_middle_button = False  # Reset
                     controller.cycle_mouse_mode()
                     continue
                 
-                # Klavye mapping'den kontrol (kol kontrolleri)
+                # Control from keyboard mapping (arm controls)
                 if key_lower in controller.key_mappings:
                     joint_name, delta = controller.key_mappings[key_lower]
                     controller.update_position(joint_name, delta)
         
         except KeyboardInterrupt:
-            print("\n\nDurduruldu.")
+            print("\n\nStopped.")
             break
         except Exception as e:
             print(f"Hata: {e}")
@@ -1593,11 +1510,11 @@ if __name__ == '__main__':
     executor_thread = threading.Thread(target=executor.spin, daemon=True)
     executor_thread.start()
 
-    # İnteraktif kontrolü başlat (control_right_arm.py gibi)
+    # Start interactive control (like control_right_arm.py)
     try:
         interactive_control(robot_keyboard_controller)
     except KeyboardInterrupt:
-        print("\n\nDurduruldu.")
+        print("\n\nStopped.")
     finally:
         rclpy.shutdown()
         executor_thread.join()

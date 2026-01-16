@@ -317,7 +317,7 @@ class ACTPolicyController(Node):
 
 def main():
     # Model path - ACT model
-    MODEL_PATH = "/home/beable/lerobot/outputs/train/act_dexterous_chunk100/checkpoints/020000/pretrained_model"
+    MODEL_PATH = "/home/beable/Desktop/r1-project/ActModel/020000/pretrained_model"
     
     rclpy.init()
     

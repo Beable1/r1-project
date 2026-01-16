@@ -90,18 +90,17 @@ class DiffusionPolicyController(Node):
         # Policy config
         self.n_obs_steps = self.policy.config.n_obs_steps
         self.n_action_steps = self.policy.config.n_action_steps
+        self.horizon = self.policy.config.horizon
         
-        # Our own observation buffers (we manage the history ourselves)
-        self.state_buffer = deque(maxlen=self.n_obs_steps)
-        self.image_buffer = deque(maxlen=self.n_obs_steps)
-        
-        # Initialize buffers with zeros
-        for _ in range(self.n_obs_steps):
-            self.state_buffer.append(np.zeros(17, dtype=np.float32))
-            self.image_buffer.append(np.zeros((3, self.vid_H, self.vid_W), dtype=np.float32))
-        
-        # Action queue (for temporal action chunking)
+        # Our own observation and action queues (bypass select_action's buggy handling)
+        self.state_queue = deque(maxlen=self.n_obs_steps)
+        self.image_queue = deque(maxlen=self.n_obs_steps)
         self.action_queue = deque(maxlen=self.n_action_steps)
+        
+        # Initialize queues with zeros
+        for _ in range(self.n_obs_steps):
+            self.state_queue.append(torch.zeros(1, 17, device=self.device))
+            self.image_queue.append(torch.zeros(1, 1, 3, self.vid_H, self.vid_W, device=self.device))
         
         # ROS2 Subscribers
         self.joint_state_sub = self.create_subscription(
@@ -155,65 +154,95 @@ class DiffusionPolicyController(Node):
         except Exception as e:
             self.get_logger().warning(f"RGB decode error: {e}")
     
-    def _update_observation_buffers(self):
-        """Add current observation to buffers"""
+    def _prepare_observation(self):
+        """Prepare current observation tensors and add to queues
+        
+        Returns current observation as tensors:
+        - state: (1, 17)
+        - image: (1, 1, 3, H, W) - (batch, num_cameras, C, H, W)
+        """
         # Get current state (17 joint positions)
         state = np.array([self.current_positions[name] for name in self.joint_names], dtype=np.float32)
+        state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)  # (1, 17)
         
         # Get current image (BGR -> RGB, HWC -> CHW, normalize to 0-1)
         image = self.current_rgb_image[:, :, ::-1].copy()  # BGR -> RGB
         image = image.transpose(2, 0, 1).astype(np.float32) / 255.0  # HWC -> CHW, 0-1
+        image_tensor = torch.from_numpy(image).unsqueeze(0).unsqueeze(1).to(self.device)  # (1, 1, 3, H, W)
         
-        # Add to buffers
-        self.state_buffer.append(state)
-        self.image_buffer.append(image)
+        # Add to queues
+        self.state_queue.append(state_tensor)
+        self.image_queue.append(image_tensor)
+        
+        return state_tensor, image_tensor
     
-    def _prepare_batch(self):
-        """Prepare batch dict for diffusion model
+    def _build_batch_from_queues(self):
+        """Build a batch from observation queues for diffusion model
         
         Returns batch with shapes:
         - observation.state: (1, n_obs_steps, 17)
-        - observation.images: (1, n_obs_steps, 1, 3, H, W)  # 1 camera
+        - observation.images: (1, n_obs_steps, num_cameras, C, H, W)
         """
-        # Stack state buffer: (n_obs_steps, 17) -> (1, n_obs_steps, 17)
-        state = np.stack(list(self.state_buffer), axis=0)
-        state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)  # (1, n_obs_steps, 17)
+        # Stack state queue: list of (1, 17) -> (1, n_obs_steps, 17)
+        states = torch.cat(list(self.state_queue), dim=0)  # (n_obs_steps, 17)
+        states = states.unsqueeze(0)  # (1, n_obs_steps, 17)
         
-        # Stack image buffer: (n_obs_steps, 3, H, W) -> (1, n_obs_steps, 1, 3, H, W)
-        images = np.stack(list(self.image_buffer), axis=0)  # (n_obs_steps, 3, H, W)
-        images_tensor = torch.from_numpy(images).unsqueeze(0).unsqueeze(2).to(self.device)
-        # Shape: (1, n_obs_steps, 1, 3, H, W) - batch=1, n_obs_steps, num_cameras=1, C, H, W
+        # Stack image queue: list of (1, 1, 3, H, W) -> (1, n_obs_steps, 1, 3, H, W)
+        images = torch.cat(list(self.image_queue), dim=0)  # (n_obs_steps, 1, 3, H, W)
+        images = images.unsqueeze(0)  # (1, n_obs_steps, 1, 3, H, W)
         
         batch = {
-            OBS_STATE: state_tensor,
-            OBS_IMAGES: images_tensor,
+            OBS_STATE: states,
+            OBS_IMAGES: images,
         }
-        
-        # Normalize inputs using policy's normalizer
-        batch = self.policy.normalize_inputs(batch)
         
         return batch
     
     @torch.no_grad()
     def _run_inference(self):
-        """Run diffusion policy inference and get action chunk"""
-        batch = self._prepare_batch()
+        """Run diffusion policy inference with manual queue management
         
-        # Generate actions directly from diffusion model
+        Bypasses select_action to avoid dimension issues.
+        Manually handles:
+        - Observation queuing
+        - Normalization
+        - Action generation
+        - Action chunking
+        - Unnormalization
+        """
+        # Update observation queues
+        self._prepare_observation()
+        
+        # If we have actions in queue, use them
+        if len(self.action_queue) > 0:
+            action = self.action_queue.popleft()
+            self.inference_count += 1
+            return action.cpu().numpy()
+        
+        # Need to generate new action chunk
+        batch = self._build_batch_from_queues()
+        
+        # Normalize inputs
+        batch = self.policy.normalize_inputs(batch)
+        
+        # Generate actions using diffusion model
         actions = self.policy.diffusion.generate_actions(batch)
         
         # Unnormalize actions
         actions = self.policy.unnormalize_outputs({ACTION: actions})[ACTION]
         
-        # actions shape: (1, horizon, 17) or (1, n_action_steps, 17)
-        actions = actions.squeeze(0).cpu().numpy()  # (n_action_steps, 17)
+        # actions shape: (1, horizon, 17)
+        actions = actions.squeeze(0)  # (horizon, 17)
         
-        # Fill action queue
-        self.action_queue.clear()
-        for i in range(min(len(actions), self.n_action_steps)):
-            self.action_queue.append(actions[i])
+        # Take n_action_steps actions and put in queue
+        for i in range(self.n_action_steps):
+            if i < len(actions):
+                self.action_queue.append(actions[i])
         
+        # Return first action
+        action = self.action_queue.popleft()
         self.inference_count += 1
+        return action.cpu().numpy()
     
     def control_loop(self):
         """Main control loop running at control_rate Hz"""
@@ -221,26 +250,18 @@ class DiffusionPolicyController(Node):
             return
         
         try:
-            # Update observation buffers
-            self._update_observation_buffers()
+            # Run inference - select_action handles observation history and action chunking internally
+            action = self._run_inference()
             
-            # Check if we need new actions
-            if len(self.action_queue) == 0:
-                self._run_inference()
+            # Send joint command
+            self._send_joint_command(action)
             
-            # Get next action from queue
-            if len(self.action_queue) > 0:
-                action = self.action_queue.popleft()
-                
-                # Send joint command
-                self._send_joint_command(action)
-                
-                # Log periodically
-                if self.inference_count % 10 == 0 and len(self.action_queue) == self.n_action_steps - 1:
-                    self.get_logger().info(
-                        f"🤖 Inference #{self.inference_count} | "
-                        f"Action[0:3]: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]"
-                    )
+            # Log periodically
+            if self.inference_count % 10 == 0:
+                self.get_logger().info(
+                    f"🤖 Inference #{self.inference_count} | "
+                    f"Action[0:3]: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]"
+                )
                     
         except Exception as e:
             self.get_logger().error(f"Inference error: {e}")
@@ -280,14 +301,15 @@ class DiffusionPolicyController(Node):
         # First, go to home position
         self.go_home(duration_sec=3.0)
         
-        # Reset buffers
-        self.state_buffer.clear()
-        self.image_buffer.clear()
+        # Reset our observation and action queues
+        self.state_queue.clear()
+        self.image_queue.clear()
         self.action_queue.clear()
         
+        # Initialize observation queues with zeros
         for _ in range(self.n_obs_steps):
-            self.state_buffer.append(np.zeros(17, dtype=np.float32))
-            self.image_buffer.append(np.zeros((3, self.vid_H, self.vid_W), dtype=np.float32))
+            self.state_queue.append(torch.zeros(1, 17, device=self.device))
+            self.image_queue.append(torch.zeros(1, 1, 3, self.vid_H, self.vid_W, device=self.device))
         
         self.is_running = True
         self.inference_count = 0
@@ -308,7 +330,7 @@ class DiffusionPolicyController(Node):
 
 def main():
     # Model path
-    MODEL_PATH = "/home/beable/lerobot/outputs/train/diffusion_dexterous_fullres2/checkpoints/last/pretrained_model"
+    MODEL_PATH = "/home/beable/lerobot/outputs/train/diffusion_dexterous_box_40ep_finetuned/checkpoints/100000/pretrained_model"
     
     rclpy.init()
     
