@@ -330,7 +330,7 @@ class DiffusionPolicyController(Node):
 
 def main():
     # Model path
-    MODEL_PATH = "/home/beable/lerobot/outputs/train/diffusion_dexterous_box_40ep_finetuned/checkpoints/100000/pretrained_model"
+    MODEL_PATH = "/home/beable/Desktop/r1-project/diffusion_dexterous_box_40ep_finetuned/checkpoints/100000/pretrained_model"
     
     rclpy.init()
     

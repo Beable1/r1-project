@@ -11,7 +11,13 @@ __pycache__/
 output/data/
 output/videos/
 output/meta/episodes/
+output/*
 
+locomotion-models/*
+ActModel/*
+outputC/*
+outputC/videos/
+outputC/meta/episodes/
 # Other dataset directories
 dexterous_manipulation_60ep/
 

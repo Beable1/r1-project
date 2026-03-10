@@ -20,6 +20,50 @@ import tty
 import subprocess
 import select
 
+import pinocchio as pin
+
+class IKSolver:
+    def __init__(self, urdf_path, ee_joint_name, controlled_joints):
+        self.model = pin.buildModelFromUrdf(urdf_path)
+        self.data = self.model.createData()
+        self.ee_id = self.model.getJointId(ee_joint_name)
+        self.controlled_joints = controlled_joints
+        
+        self.q_idx = []
+        self.v_idx = []
+        for name in self.controlled_joints:
+            if self.model.existJointName(name):
+                j_id = self.model.getJointId(name)
+                self.q_idx.append(self.model.joints[j_id].idx_q)
+                self.v_idx.append(self.model.joints[j_id].idx_v)
+                
+    def solve(self, q_current_full, target_pos, target_rot=None, max_iter=50, eps=1e-3):
+        q = np.copy(q_current_full)
+        target_se3 = pin.SE3(target_rot if target_rot is not None else np.eye(3), target_pos)
+        damp = 1e-4
+        dt = 0.5
+        
+        for i in range(max_iter):
+            pin.forwardKinematics(self.model, self.data, q)
+            pin.updateFramePlacements(self.model, self.data)
+            
+            iMd = self.data.oMi[self.ee_id].actInv(target_se3)
+            err = pin.log(iMd).vector
+            
+            if np.linalg.norm(err) < eps:
+                break
+            
+            J = pin.computeJointJacobian(self.model, self.data, q, self.ee_id)
+            J_masked = np.zeros_like(J)
+            for vj in self.v_idx:
+                J_masked[:, vj] = J[:, vj]
+                
+            v = J_masked.T @ np.linalg.solve(J_masked @ J_masked.T + damp * np.eye(6), err)
+            q = pin.integrate(self.model, q, v * dt)
+            q = np.clip(q, self.model.lowerPositionLimit, self.model.upperPositionLimit)
+            
+        return q
+
 # Mouse control
 try:
     from pynput import mouse
@@ -367,6 +411,31 @@ class Robot_Keyboard_Controller(Node):
         # Current positions (start from zero - like control_right_arm.py)
         self.current_positions = {name: 0.0 for name in self.joint_names}
 
+        self.ik_solver = None
+        try:
+            urdf_path = "/home/beable/IsaacLab/IsaacLab/r1-new/urdf/r1-new.urdf"
+            self.ik_solver = IKSolver(urdf_path, "wrist_pitch_joint_r", [
+                "right_shoulder_link_joint",
+                "right_arm_top_link_joint",
+                "right_arm_bottom_link_joint",
+                "right_forearm_link_joint",
+                "wrist_roll_joint_r",
+                "wrist_pitch_joint_r"
+            ])
+            self.use_ik = True
+            
+            # Start neutral
+            q = pin.neutral(self.ik_solver.model)
+            pin.forwardKinematics(self.ik_solver.model, self.ik_solver.data, q)
+            self.target_se3 = pin.SE3(self.ik_solver.data.oMi[self.ik_solver.ee_id].rotation.copy(), 
+                                      self.ik_solver.data.oMi[self.ik_solver.ee_id].translation.copy())
+        except Exception as e:
+            self.get_logger().error(f"IK Init failed: {e}")
+            self.use_ik = False
+        
+        self.cart_step = 0.01
+        self.rot_step = 0.05
+
         # Target positions: for non-blocking smooth movement (all joints)
         self.target_positions = self.current_positions.copy()
         
@@ -426,10 +495,10 @@ class Robot_Keyboard_Controller(Node):
         # Keyboard mapping (same as control_right_arm.py)
         self.key_mappings = {
             # Shoulder
-            'a': ("right_shoulder_link_joint", +self.step_size),
-            'w': ("right_shoulder_link_joint", -self.step_size),
-            's': ("right_arm_top_link_joint", +self.step_size),
-            'd': ("right_arm_top_link_joint", -self.step_size),
+            's': ("right_shoulder_link_joint", +self.step_size),
+            'd': ("right_shoulder_link_joint", -self.step_size),
+            'a': ("right_arm_top_link_joint", +self.step_size),
+            'w': ("right_arm_top_link_joint", -self.step_size),
             
             # Elbow
             'e': ("right_arm_bottom_link_joint", +self.step_size),
@@ -727,6 +796,42 @@ class Robot_Keyboard_Controller(Node):
                 return False
         return True
         
+
+    def update_cartesian(self, delta_pos, delta_rot=None):
+        if not getattr(self, "use_ik", False): return
+        
+        # Build q from current targets so we don't jump
+        q = pin.neutral(self.ik_solver.model)
+        for name, p in self.target_positions.items():
+            if self.ik_solver.model.existJointName(name):
+                j_id = self.ik_solver.model.getJointId(name)
+                idx_q = self.ik_solver.model.joints[j_id].idx_q
+                if idx_q < self.ik_solver.model.nq:
+                    q[idx_q] = p
+                    
+        pin.forwardKinematics(self.ik_solver.model, self.ik_solver.data, q)
+        pin.updateFramePlacements(self.ik_solver.model, self.ik_solver.data)
+        self.target_se3 = pin.SE3(self.ik_solver.data.oMi[self.ik_solver.ee_id].rotation.copy(), 
+                                  self.ik_solver.data.oMi[self.ik_solver.ee_id].translation.copy())
+                                  
+        if delta_pos is not None:
+            self.target_se3.translation += np.array(delta_pos)
+            
+        if delta_rot is not None:
+            r, p, y = delta_rot
+            Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
+            Ry = np.array([[np.cos(p), 0, np.sin(p)], [0, 1, 0], [-np.sin(p), 0, np.cos(p)]])
+            Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+            dR = Rz @ Ry @ Rx
+            self.target_se3.rotation = self.target_se3.rotation @ dR
+            
+        q_res = self.ik_solver.solve(q, self.target_se3.translation, self.target_se3.rotation.copy())
+        
+        for name in self.ik_solver.controlled_joints:
+            j_id = self.ik_solver.model.getJointId(name)
+            idx_q = self.ik_solver.model.joints[j_id].idx_q
+            self.target_positions[name] = float(q_res[idx_q])
+
     def update_position(self, joint_name, delta):
         """Update joint position and send command"""
         global action
@@ -856,8 +961,18 @@ class RGB_Camera_Subscriber(Node):
     def camera_callback(self, data):
         global rgb_image
         try:
-            rgb_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
-        except Exception:
+            # Isaac Sim sometimes sends memory that trips up cv_bridge's imgmsg_to_cv2.
+            # Convert directly via numpy for stability.
+            img_arr = np.frombuffer(data.data, dtype=np.uint8).reshape((data.height, data.width, -1))
+            
+            # If Isaac sends RGB, convert to BGR for OpenCV
+            if data.encoding.lower() == 'rgb8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+            elif data.encoding.lower() == 'rgba8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2BGR)
+                
+            rgb_image = cv2.resize(img_arr, (vid_W, vid_H), cv2.INTER_LINEAR)
+        except Exception as e:
             pass
 
 class Wrist_Camera_Subscriber(Node):
@@ -875,7 +990,12 @@ class Wrist_Camera_Subscriber(Node):
     def camera_callback(self, data):
         global wrist_camera_image
         try:
-            wrist_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+            img_arr = np.frombuffer(data.data, dtype=np.uint8).reshape((data.height, data.width, -1))
+            if data.encoding.lower() == 'rgb8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+            elif data.encoding.lower() == 'rgba8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2BGR)
+            wrist_camera_image = cv2.resize(img_arr, (vid_W, vid_H), cv2.INTER_LINEAR)
         except:
             pass
 
@@ -894,7 +1014,12 @@ class Top_Camera_Subscriber(Node):
     def camera_callback(self, data):
         global top_camera_image
         try:
-            top_camera_image = cv2.resize(bridge.imgmsg_to_cv2(data, "bgr8"), (vid_W, vid_H), cv2.INTER_LINEAR)
+            img_arr = np.frombuffer(data.data, dtype=np.uint8).reshape((data.height, data.width, -1))
+            if data.encoding.lower() == 'rgb8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+            elif data.encoding.lower() == 'rgba8':
+                img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2BGR)
+            top_camera_image = cv2.resize(img_arr, (vid_W, vid_H), cv2.INTER_LINEAR)
         except:
             pass
 
@@ -933,6 +1058,8 @@ class Data_Recorder(Node):
 
         self.df = pd.DataFrame(columns=['observation.state', 'action', 'episode_index', 'frame_index', 'timestamp', 'index', 'task_index'])
         self.frame_index = 0
+        self.previous_observation_state = None
+        self.previous_ee_state = None
         self.time_stamp = 0.0
         self.column_index = 0
 
@@ -944,6 +1071,47 @@ class Data_Recorder(Node):
         
         # Load existing meta if available
         self._load_existing_meta()
+
+        # Initialize Pinocchio for EE conversion
+        try:
+            import pinocchio as pin
+            urdf_path = "/home/beable/IsaacLab/IsaacLab/r1-new/urdf/r1-new.urdf"
+            self.model = pin.buildModelFromUrdf(urdf_path)
+            self.data = self.model.createData()
+            if self.model.existJointName("wrist_pitch_joint_r"):
+                self.ee_id = self.model.getJointId("wrist_pitch_joint_r")
+            else:
+                self.ee_id = self.model.getFrameId("wrist_pitch_joint_r")
+            self.use_ee = True
+        except Exception as e:
+            self.get_logger().error(f"Pinocchio Init failed in Data_Recorder: {e}")
+            self.use_ee = False
+
+    def get_ee_pose_and_gripper(self, joint_positions, joint_names):
+        import pinocchio as pin
+        import numpy as np
+        if not getattr(self, "use_ee", False):
+            return np.array(joint_positions).tolist()
+        
+        q = pin.neutral(self.model)
+        for name, p in zip(joint_names, joint_positions):
+            if self.model.existJointName(name):
+                j_id = self.model.getJointId(name)
+                idx_q = self.model.joints[j_id].idx_q
+                if idx_q < self.model.nq:
+                    q[idx_q] = p
+                    
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        
+        se3 = self.data.oMi[self.ee_id]
+        pos = se3.translation
+        rpy = pin.rpy.matrixToRpy(se3.rotation)
+        
+        # Gripper joints are from index 6 onwards
+        gripper_joints = joint_positions[6:]
+        
+        return np.concatenate([pos, rpy, gripper_joints]).tolist()
 
     def _detect_last_episode(self):
         """Detect last episode number from existing parquet files"""
@@ -1048,6 +1216,31 @@ class Data_Recorder(Node):
             
             # Action: joint positions from /joint_command (sent by control_right_arm.py)
             action_to_save = copy.copy(action.tolist() if len(action) > 0 else [])
+
+            # CONVERT TO EE SPACE
+            current_ee_state = self.get_ee_pose_and_gripper(observation_state, right_arm_joint_names)
+            target_ee_state = self.get_ee_pose_and_gripper(action_to_save, right_arm_joint_names) if len(action_to_save) > 0 else [0.0]*len(current_ee_state)
+
+            # OVERRIDE FOR DELTA ACTION: target_ee - current_ee
+            if len(current_ee_state) == len(target_ee_state):
+                action_to_save = [t - c for t, c in zip(target_ee_state, current_ee_state)]
+                # Wrap rpy differences
+                for i in range(3, 6):
+                    action_to_save[i] = np.arctan2(np.sin(action_to_save[i]), np.cos(action_to_save[i]))
+            else:
+                action_to_save = [0.0] * len(current_ee_state)
+            
+            # OVERRIDE FOR DELTA STATE: Calculate delta state from previous frame
+            if getattr(self, "previous_ee_state", None) is None or len(self.previous_ee_state) != len(current_ee_state):
+                delta_observation_state = [0.0] * len(current_ee_state)
+            else:
+                delta_observation_state = [o - p for o, p in zip(current_ee_state, self.previous_ee_state)]
+                # Wrap rpy differences
+                for i in range(3, 6):
+                    delta_observation_state[i] = np.arctan2(np.sin(delta_observation_state[i]), np.cos(delta_observation_state[i]))
+            
+            self.previous_ee_state = copy.copy(current_ee_state)
+            observation_state = delta_observation_state
             
             # DEBUG: Check if joint states are being received
             if self.frame_index == 0:  # First frame
@@ -1176,6 +1369,8 @@ class Data_Recorder(Node):
                 self.data_recorded = True
                 self.episode_index += 1  # Increment episode for next recording
                 self.frame_index = 0
+                self.previous_observation_state = None
+                self.previous_ee_state = None
                 self.time_stamp = 0.0
                 self.column_index = 0
                 self.start_recording = False
@@ -1218,14 +1413,9 @@ class Data_Recorder(Node):
         """Generate all meta files in LeRobot v3.0 format"""
         import json
         
-        # Joint isimleri (observation.state ve action için)
-        joint_names = [
-            "right_shoulder_link_joint",
-            "right_arm_top_link_joint",
-            "right_arm_bottom_link_joint",
-            "right_forearm_link_joint",
-            "wrist_pitch_joint_r",
-            "wrist_roll_joint_r",
+        # YENI format: End effector delta pozisyon ve oryantasyonu + parmaklar
+        ee_names = [
+            "x", "y", "z", "roll", "pitch", "yaw",
             "thumb_joint_roll_r",
             "index_proximal_joint_r",
             "middle_proximal_joint_r",
@@ -1253,13 +1443,13 @@ class Data_Recorder(Node):
             "features": {
                 "observation.state": {
                     "dtype": "float32",
-                    "shape": [len(joint_names)],
-                    "names": joint_names
+                    "shape": [len(ee_names)],
+                    "names": ee_names
                 },
                 "action": {
                     "dtype": "float32",
-                    "shape": [len(joint_names)],
-                    "names": joint_names
+                    "shape": [len(ee_names)],
+                    "names": ee_names
                 },
                 "observation.images.rgb": {
                     "dtype": "video",
@@ -1323,20 +1513,20 @@ class Data_Recorder(Node):
             episodes_df.to_parquet(episodes_path, index=False)
             print(f"✅ episodes meta parquet created: {len(self.all_episodes_meta)} episodes")
         
-        # 4. stats.json (basit istatistikler - joint isimleriyle)
+        # 4. stats.json (basit istatistikler - ee isimleriyle)
         stats = {
             "observation.state": {
-                "min": {name: -3.14 for name in joint_names},
-                "max": {name: 3.14 for name in joint_names},
-                "mean": {name: 0.0 for name in joint_names},
-                "std": {name: 1.0 for name in joint_names},
+                "min": {name: -3.14 for name in ee_names},
+                "max": {name: 3.14 for name in ee_names},
+                "mean": {name: 0.0 for name in ee_names},
+                "std": {name: 1.0 for name in ee_names},
                 "count": self.total_frames
             },
             "action": {
-                "min": {name: -3.14 for name in joint_names},
-                "max": {name: 3.14 for name in joint_names},
-                "mean": {name: 0.0 for name in joint_names},
-                "std": {name: 1.0 for name in joint_names},
+                "min": {name: -3.14 for name in ee_names},
+                "max": {name: 3.14 for name in ee_names},
+                "mean": {name: 0.0 for name in ee_names},
+                "std": {name: 1.0 for name in ee_names},
                 "count": self.total_frames
             }
         }
@@ -1362,15 +1552,15 @@ def interactive_control(controller):
     print(f"\nROS2 Topic: /joint_command")
     print(f"Controlled joints: {len(controller.joint_names)}")
     print("\n⌨️  KEYBOARD CONTROL:")
-    print("  Shoulder:")
-    print("    a / w  -> right_shoulder_link_joint (+/- 0.01 rad)")
-    print("    s / d  -> right_arm_top_link_joint (+/- 0.01 rad)")
-    print("  Elbow:")
-    print("    e / r  -> right_arm_bottom_link_joint (+/- 0.01 rad)")
-    print("    f / t  -> right_forearm_link_joint (+/- 0.01 rad)")
-    print("  Wrist:")
-    print("    q / y  -> wrist_pitch_joint_r (+/- 0.01 rad)")
-    print("    z / x  -> wrist_roll_joint_r (+/- 0.01 rad)")
+    print("  (IK Coordinate System if IK is active, otherwise Joints):")
+    print("  Movement:")
+    print("    a / d  -> Arm Forward / Backward (+/- X axis)")
+    print("    s / w  -> Arm Left / Right (+/- Y axis)")
+    print("    e / r  -> Arm Up / Down (+/- Z axis)")
+    print("  Rotation:")
+    print("    f / t  -> Pitch (+/- Y axis rot)")
+    print("    q / y  -> Yaw (+/- Z axis rot)")
+    print("    z / x  -> Roll (+/- X axis rot)")
     print("    c / v  -> thumb_joint_roll_r (+/- 0.01 rad)")
     print("    b      -> thumb_joint_roll_r toggle open/close")
     print("  Fingers (3-step cycle):")
@@ -1478,10 +1668,30 @@ def interactive_control(controller):
                     controller.cycle_mouse_mode()
                     continue
                 
-                # Control from keyboard mapping (arm controls)
-                if key_lower in controller.key_mappings:
+                # Control from keyboard mapping (arm controls + IK cartesian)
+                if key_lower in controller.key_mappings and not controller.use_ik:
                     joint_name, delta = controller.key_mappings[key_lower]
                     controller.update_position(joint_name, delta)
+                    continue
+                
+                if controller.use_ik:
+                    # override keyboard
+                    if key_lower == 'a': controller.update_cartesian([0.01, 0, 0]); continue   # mapped to +X (forward)
+                    if key_lower == 'd': controller.update_cartesian([-0.01, 0, 0]); continue  # mapped to -X (backward)
+                    if key_lower == 's': controller.update_cartesian([0, 0.01, 0]); continue   # mapped to +Y (left)
+                    if key_lower == 'w': controller.update_cartesian([0, -0.01, 0]); continue  # mapped to -Y (right)
+                    if key_lower == 'e': controller.update_cartesian([0, 0, 0.01]); continue
+                    if key_lower == 'r': controller.update_cartesian([0, 0, -0.01]); continue
+                    
+                    if key_lower == 'f': controller.update_cartesian(None, [0, 0.05, 0]); continue
+                    if key_lower == 't': controller.update_cartesian(None, [0, -0.05, 0]); continue
+                    if key_lower == 'q': controller.update_cartesian(None, [0, 0, 0.05]); continue
+                    if key_lower == 'y': controller.update_cartesian(None, [0, 0, -0.05]); continue
+                    if key_lower == 'z': controller.update_cartesian(None, [0.05, 0, 0]); continue
+                    if key_lower == 'x': controller.update_cartesian(None, [-0.05, 0, 0]); continue
+                    
+                    if key_lower == 'c': controller.update_position("thumb_joint_roll_r", +controller.step_size * 3); continue
+                    if key_lower == 'v': controller.update_position("thumb_joint_roll_r", -controller.step_size * 3); continue
         
         except KeyboardInterrupt:
             print("\n\nStopped.")

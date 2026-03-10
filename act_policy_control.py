@@ -23,13 +23,16 @@ from collections import deque
 from lerobot.policies.act.modeling_act import ACTPolicy
 
 
+import argparse
+
 class ACTPolicyController(Node):
     """ROS2 Node that controls robot using trained ACT Policy"""
     
-    def __init__(self, model_path: str, device: str = "cuda"):
+    def __init__(self, model_path: str, device: str = "cuda", noise_level: float = 0.0):
         super().__init__('act_policy_controller')
         
         self.device = device
+        self.noise_level = noise_level
         self.bridge = CvBridge()
         
         # Video dimensions (must match training - from config)
@@ -124,6 +127,8 @@ class ACTPolicyController(Node):
         self.get_logger().info("✅ ACT Policy Controller initialized!")
         self.get_logger().info(f"   n_obs_steps: {self.n_obs_steps}, chunk_size: {self.chunk_size}")
         self.get_logger().info(f"   n_action_steps: {self.n_action_steps}")
+        if self.noise_level > 0:
+            self.get_logger().info(f"   ⚠️ NOISE INJECTION ACTIVE: std={self.noise_level}")
         self.get_logger().info("   Press ENTER to start/stop control, 'q' to quit")
     
     def _load_model(self, model_path: str):
@@ -165,6 +170,11 @@ class ACTPolicyController(Node):
         # Get current state (17 joint positions)
         state = np.array([self.current_positions[name] for name in self.joint_names], dtype=np.float32)
         
+        # Add noise if enabled
+        if self.noise_level > 0.0:
+            noise = np.random.normal(0, self.noise_level, state.shape)
+            state += noise
+            
         # Get current image (BGR -> RGB, HWC -> CHW, normalize to 0-1)
         image = self.current_rgb_image[:, :, ::-1].copy()  # BGR -> RGB
         image = image.transpose(2, 0, 1).astype(np.float32) / 255.0  # HWC -> CHW, 0-1
@@ -316,13 +326,22 @@ class ACTPolicyController(Node):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="ACT Policy Controller")
+    parser.add_argument("--noise", type=float, default=0.0, help="Standard deviation of noise to add to joint states (default: 0.0)")
+    parser.add_argument("--model", type=str, default="/home/beable/Desktop/r1-project/ActModel/020000/pretrained_model", help="Path to pretrained model")
+    
+    args = parser.parse_args()
+    
     # Model path - ACT model
-    MODEL_PATH = "/home/beable/Desktop/r1-project/ActModel/020000/pretrained_model"
+    MODEL_PATH = args.model
+    NOISE_LEVEL = args.noise
+    
+    print(f"Start with noise level: {NOISE_LEVEL}")
     
     rclpy.init()
     
     # Create controller node
-    controller = ACTPolicyController(model_path=MODEL_PATH)
+    controller = ACTPolicyController(model_path=MODEL_PATH, noise_level=NOISE_LEVEL)
     
     # Spin ROS2 in background
     executor = rclpy.executors.MultiThreadedExecutor()
