@@ -23,6 +23,8 @@ import pandas as pd
 from tqdm import tqdm
 import cv2
 import subprocess
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Dataset yolu
 DATASET_ROOT = Path(__file__).resolve().parent / "output"
@@ -104,6 +106,61 @@ def rename_files_to_lerobot_format(dataset_root: Path) -> None:
                 print(f"  Uyarı: {old_dir.name}/ temizlenemedi: {e}")
     
     print("  ✓ Dosya yapısı dönüştürüldü")
+
+def make_frame_index_continuous(dataset_root: Path) -> None:
+    """Tüm data parquet dosyalarındaki frame_index, index ve timestamp sütunlarını düzeltir.
+    
+    - index: Tüm dataset boyunca global, ardışık (0'dan başlayarak)
+    - frame_index: Her episode içinde 0'dan başlayan, per-episode index
+      (LeRobot video decoder frame_index ile video frame'e erişir)
+    - timestamp: Her episode içinde 0.0'dan başlayan, per-episode (frame_index / fps)
+    """
+    print("\n=== frame_index, index ve timestamp sütunları düzeltiliyor ===")
+    data_dir = dataset_root / "data"
+    if not data_dir.exists():
+        print("  ✗ data/ dizini bulunamadı.")
+        return
+        
+    global_index = 0
+    fps = 10.0
+    
+    for chunk_dir in sorted(data_dir.iterdir()):
+        if chunk_dir.is_dir():
+            for parquet_file in sorted(chunk_dir.iterdir()):
+                if parquet_file.suffix == ".parquet" and parquet_file.name.startswith("episode_"):
+                    df = pd.read_parquet(parquet_file)
+                    length = len(df)
+                    
+                    # frame_index: per-episode, 0'dan başlar (video decoder bunu kullanır)
+                    per_episode_indices = list(range(length))
+                    df['frame_index'] = per_episode_indices
+                    
+                    # index: global, tüm dataset boyunca ardışık
+                    df['index'] = list(range(global_index, global_index + length))
+                    
+                    # timestamp: per-episode, frame_index / fps
+                    df['timestamp'] = [float(i / fps) for i in per_episode_indices]
+                    
+                    if 'task_index' not in df.columns:
+                        df['task_index'] = 0
+                        
+                    arrays = [
+                        pa.array(df['observation.state'].tolist(), pa.list_(pa.float32())),
+                        pa.array(df['action'].tolist(), pa.list_(pa.float32())),
+                        pa.array(df['episode_index'].astype(np.int64), pa.int64()),
+                        pa.array(df['frame_index'].astype(np.int64), pa.int64()),
+                        pa.array(df['timestamp'].astype(np.float32), pa.float32()),
+                        pa.array(df['index'].astype(np.int64), pa.int64()),
+                        pa.array(df['task_index'].astype(np.int64), pa.int64())
+                    ]
+                    names = ['observation.state', 'action', 'episode_index', 'frame_index', 'timestamp', 'index', 'task_index']
+                    table = pa.Table.from_arrays(arrays, names=names)
+                    
+                    pq.write_table(table, parquet_file)
+                    
+                    global_index += length
+                    
+    print(f"  ✓ Toplam {global_index} kare: index global ardışık, frame_index ve timestamp per-episode olarak düzeltildi.")
 
 def load_video_frames_sample(video_path: Path, sample_size: int = 100) -> np.ndarray:
     """Video'dan örnek frame'ler yükler."""
@@ -258,45 +315,57 @@ def create_episodes_jsonl(dataset_root: Path) -> None:
     
     episodes = []
     
-    # Episodes parquet'den oku
-    if episodes_parquet_dir.exists():
-        print(f"  Episodes parquet dosyaları okunuyor...")
-        for chunk_dir in sorted(episodes_parquet_dir.iterdir()):
-            if chunk_dir.is_dir():
-                for parquet_file in sorted(chunk_dir.iterdir()):
-                    if parquet_file.suffix == ".parquet":
-                        df = pd.read_parquet(parquet_file)
-                        for _, row in df.iterrows():
-                            # Handle tasks field - convert numpy array to list if needed
-                            tasks_val = row["tasks"]
-                            if hasattr(tasks_val, 'tolist'):
-                                tasks_val = tasks_val.tolist()
-                            elif not isinstance(tasks_val, list):
-                                tasks_val = [tasks_val]
-                            
-                            ep_data = {
-                                "episode_index": int(row["episode_index"]),
-                                "tasks": tasks_val,
-                                "length": int(row["length"])
-                            }
-                            episodes.append(ep_data)
+    # Data dosyalarından episode bilgileri hesaplanıyor (Eski bozuk parquet'i görmezden gel)
+    print(f"  Data dosyalarından episode bilgileri hesaplanıyor...")
+    for chunk_dir in sorted(data_dir.iterdir()):
+        if chunk_dir.is_dir():
+            for parquet_file in sorted(chunk_dir.iterdir()):
+                if parquet_file.suffix == ".parquet":
+                    df = pd.read_parquet(parquet_file)
+                    if 'episode_index' in df.columns:
+                        ep_idx = int(df['episode_index'].iloc[0])
+                        length = len(df)
+                        episodes.append({
+                            "episode_index": ep_idx,
+                            "tasks": ["Pick the yellow box and put it in the empty box"],
+                            "length": length
+                        })
     
-    # Eğer episodes bulunamadıysa, data dosyalarından hesapla
-    if not episodes:
-        print(f"  Data dosyalarından episode bilgileri hesaplanıyor...")
-        for chunk_dir in sorted(data_dir.iterdir()):
-            if chunk_dir.is_dir():
-                for parquet_file in sorted(chunk_dir.iterdir()):
-                    if parquet_file.suffix == ".parquet":
-                        df = pd.read_parquet(parquet_file)
-                        if 'episode_index' in df.columns:
-                            ep_idx = df['episode_index'].iloc[0]
-                            length = len(df)
-                            episodes.append({
-                                "episode_index": int(ep_idx),
-                                "tasks": ["robot_arm_control"],
-                                "length": length
-                            })
+    # Sort by episode_index
+    episodes = sorted(episodes, key=lambda x: x["episode_index"])
+    
+    # Detail every episode with dataset_from_index and file indices
+    current_idx = 0
+    detailed_episodes = []
+    fps = 10.0
+    for ep in episodes:
+        detailed_ep = {
+            "episode_index": ep["episode_index"],
+            "tasks": ep["tasks"],
+            "length": ep["length"],
+            "dataset_from_index": current_idx,
+            "dataset_to_index": current_idx + ep["length"],
+            "data/chunk_index": 0,
+            "data/file_index": ep["episode_index"],
+            "videos/observation.images.rgb/chunk_index": 0,
+            "videos/observation.images.rgb/file_index": ep["episode_index"],
+            "videos/observation.images.rgb/from_timestamp": 0.0,
+            "videos/observation.images.rgb/to_timestamp": float((ep["length"] - 1) / fps),
+        }
+        current_idx += ep["length"]
+        detailed_episodes.append(detailed_ep)
+    
+    episodes = detailed_episodes
+    
+    # `meta/episodes/chunk-000/file-000.parquet` ve `meta/episodes/file-000.parquet` yeniden oluştur
+    chunk_000_dir = episodes_parquet_dir / "chunk-000"
+    chunk_000_dir.mkdir(parents=True, exist_ok=True)
+    if detailed_episodes:
+        episodes_df = pd.DataFrame(detailed_episodes)
+        episodes_df.to_parquet(chunk_000_dir / "file-000.parquet", index=False)
+        episodes_df.to_parquet(episodes_parquet_dir / "file-000.parquet", index=False)
+        print(f"  ✓ {chunk_000_dir / 'file-000.parquet'} doğru şekilde yeniden oluşturuldu.")
+
     
     # Sort by episode_index
     episodes = sorted(episodes, key=lambda x: x["episode_index"])
@@ -526,29 +595,42 @@ def update_info_json(dataset_root: Path) -> None:
     with open(info_path, 'r') as f:
         info = json.load(f)
     
+    # Calculate correct total_episodes and total_frames from episodes.jsonl
+    episodes_jsonl_path = dataset_root / "meta" / "episodes.jsonl"
+    total_frames = 0
+    total_episodes = 0
+    if episodes_jsonl_path.exists():
+        with open(episodes_jsonl_path, 'r') as f:
+            for line in f:
+                ep = json.loads(line)
+                total_frames += ep.get('length', 0)
+                total_episodes += 1
+        
+        info["total_episodes"] = total_episodes
+        info["total_frames"] = total_frames
+        
+        if "splits" not in info:
+            info["splits"] = {}
+        info["splits"]["train"] = f"0:{total_episodes}"
+        print(f"  ✓ total_episodes ({total_episodes}) ve total_frames ({total_frames}) güncellendi")
+
+    
     # chunks_size ekle (eğer yoksa)
     if "chunks_size" not in info:
         info["chunks_size"] = 1000
         print("  ✓ chunks_size eklendi")
     
     # data_path formatını güncelle - LeRobot beklediği format
-    old_data_path = info.get("data_path", "")
-    expected_data_path = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
-    if "chunk_index" in old_data_path or "file_index" in old_data_path:
-        info["data_path"] = expected_data_path
-        print(f"  ✓ data_path güncellendi: {expected_data_path}")
+    info["data_path"] = "data/chunk-{chunk_index:03d}/episode_{file_index:06d}.parquet"
+    print(f"  ✓ data_path güncellendi: {info['data_path']}")
     
     # video_path formatını güncelle - LeRobot beklediği format
-    old_video_path = info.get("video_path", "")
-    expected_video_path = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
-    if "chunk_index" in old_video_path or "file_index" in old_video_path:
-        info["video_path"] = expected_video_path
-        print(f"  ✓ video_path güncellendi: {expected_video_path}")
+    info["video_path"] = "videos/chunk-{chunk_index:03d}/{video_key}/episode_{file_index:06d}.mp4"
+    print(f"  ✓ video_path güncellendi: {info['video_path']}")
     
-    # codebase_version kontrolü
-    if info.get("codebase_version") not in ["v2.0", "v2.1", "v3.0"]:
-        info["codebase_version"] = "v2.1"
-        print(f"  ✓ codebase_version güncellendi: v2.1")
+    # codebase_version güncelleyelim (Kullanıcı talebi v3.0)
+    info["codebase_version"] = "v3.0"
+    print("  ✓ codebase_version güncellendi: v3.0")
     
     # Kaydet
     with open(info_path, 'w') as f:
@@ -611,6 +693,9 @@ def main():
     
     # 0. Dosya yapısını LeRobot formatına dönüştür
     rename_files_to_lerobot_format(DATASET_ROOT)
+
+    # 0.1 frame_index sütununu bölümler arası sıfırlanmayacak şekilde değiştir
+    make_frame_index_continuous(DATASET_ROOT)
     
     # 1. tasks.jsonl oluştur
     create_tasks_jsonl(DATASET_ROOT)

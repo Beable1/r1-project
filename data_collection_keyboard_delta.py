@@ -36,6 +36,19 @@ class IKSolver:
                 j_id = self.model.getJointId(name)
                 self.q_idx.append(self.model.joints[j_id].idx_q)
                 self.v_idx.append(self.model.joints[j_id].idx_v)
+
+        # Shoulder yaw limit override: [-1.1, 1.1] rad
+        # Joint name in URDF: "right_shoulder_link_joint"
+        try:
+            if self.model.existJointName("right_shoulder_link_joint"):
+                j_id = self.model.getJointId("right_shoulder_link_joint")
+                idx_q = self.model.joints[j_id].idx_q
+                if idx_q < self.model.nq:
+                    self.model.lowerPositionLimit[idx_q] = -1.1
+                    self.model.upperPositionLimit[idx_q] = 1.1
+        except Exception:
+            # Güvenli tarafta kal: limit ayarı başarısız olursa default limitler kullanılsın
+            pass
                 
     def solve(self, q_current_full, target_pos, target_rot=None, max_iter=50, eps=1e-3):
         q = np.copy(q_current_full)
@@ -1170,7 +1183,9 @@ class Data_Recorder(Node):
             try:
                 episodes_df = pd.read_parquet(episodes_parquet)
                 self.all_episodes_meta = episodes_df.to_dict('records')
-                print(f"📂 Existing episodes meta loaded: {len(self.all_episodes_meta)} episodes")
+                # Calculate total frames from episodes to ensure exact sync
+                self.total_frames = sum([ep.get('length', 0) for ep in self.all_episodes_meta])
+                print(f"📂 Existing episodes meta loaded: {len(self.all_episodes_meta)} episodes, recalculated {self.total_frames} total frames")
             except Exception as e:
                 print(f"⚠ Episodes meta load error: {e}")
 
@@ -1429,6 +1444,9 @@ class Data_Recorder(Node):
             "thumb_proximal_joint_r_1",
         ]
         
+        # Ensure total_frames is correct before generating info.json
+        self.total_frames = sum([ep.get('length', 0) for ep in self.all_episodes_meta])
+        
         # 1. info.json
         info = {
             "codebase_version": "v3.0",
@@ -1500,8 +1518,8 @@ class Data_Recorder(Node):
         
         # 2. tasks.parquet
         tasks_df = pd.DataFrame({
-            "task_index": [0],
-        }, index=["robot_arm_control"])
+            "task_index": [1],
+        }, index=["Pick the red box and put it in the empty box"])
         tasks_path = os.path.join(self.meta_dir, "tasks.parquet")
         tasks_df.to_parquet(tasks_path)
         print(f"✅ tasks.parquet created")

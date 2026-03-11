@@ -13,6 +13,7 @@ output/videos/
 output/meta/episodes/
 output/*
 
+GR00T/*
 locomotion-models/*
 ActModel/*
 outputC/*
