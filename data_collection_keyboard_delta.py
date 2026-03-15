@@ -1519,7 +1519,7 @@ class Data_Recorder(Node):
         # 2. tasks.parquet
         tasks_df = pd.DataFrame({
             "task_index": [1],
-        }, index=["Pick the red box and put it in the empty box"])
+        }, index=["Pick the yellow box and put it in the empty box"])
         tasks_path = os.path.join(self.meta_dir, "tasks.parquet")
         tasks_df.to_parquet(tasks_path)
         print(f"✅ tasks.parquet created")
